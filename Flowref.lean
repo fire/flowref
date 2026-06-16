@@ -581,8 +581,9 @@ FUNC symbols (name, vaddr, size). This is the discovery menu you pick from for
 def runList (bin : String) (json : Bool := false) : IO Unit := do
   match ← readElf bin with
   | none =>
-    if json then IO.println (Json.mkObj [("error", Json.str s!"'{bin}' is not a readable ELF")]).compress
-    else IO.eprintln s!"error: '{bin}' is not a readable ELF"
+    let msg ← notElfMessage bin
+    if json then IO.println (Json.mkObj [("error", Json.str msg)]).compress
+    else IO.eprintln s!"error: {msg}"
     IO.Process.exit 3
   | some info =>
     let archTok := info.arch

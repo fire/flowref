@@ -201,5 +201,50 @@ else
   echo "skip: python3 not available for JSON validation"
 fi
 
+echo "== 16. ELF byte-swap path + non-ELF container messaging =="
+if command -v python3 >/dev/null 2>&1; then
+  # Generate a minimal big-endian (PPC64) ELF and its little-endian (x86-64) twin,
+  # each with one FUNC symbol myfunc @ 0x1000 size 0x20. The shim must recover the
+  # SAME vaddr/size from both — that exercises the rd16/rd32/rd64 byte-swap.
+  GEN="$(mktemp /tmp/flowref-mkelf.XXXXXX.py)"
+  cat > "$GEN" <<'PY'
+import struct, sys
+def build(endian, machine):
+    E=endian
+    shstr=b'\0.text\0.symtab\0.strtab\0.shstrtab\0'
+    soff=lambda n: shstr.index(b'\0'+n+b'\0')+1
+    strtab=b'\0myfunc\0'
+    symtab=struct.pack(E+'IBBHQQ',0,0,0,0,0,0)+struct.pack(E+'IBBHQQ',1,(1<<4)|2,0,1,0x1000,0x20)
+    EHSZ=64; SHSZ=64; nsh=5; sh_off=EHSZ
+    text_off=sh_off+nsh*SHSZ; symtab_off=text_off; strtab_off=symtab_off+len(symtab); shstr_off=strtab_off+len(strtab)
+    sh=lambda name,typ,addr,off,size,link=0,ent=0: struct.pack(E+'IIQQQQIIQQ',name,typ,0,addr,off,size,link,0,1,ent)
+    shdrs=sh(0,0,0,0,0)+sh(soff(b'.text'),1,0x1000,text_off,0)+sh(soff(b'.symtab'),2,0,symtab_off,len(symtab),3,24)+sh(soff(b'.strtab'),3,0,strtab_off,len(strtab))+sh(soff(b'.shstrtab'),3,0,shstr_off,len(shstr))
+    ei=bytes([0x7f,69,76,70,2,(2 if endian=='>' else 1),1,0,0,0,0,0,0,0,0,0])
+    eh=ei+struct.pack(E+'HHIQQQIHHHHHH',2,machine,1,0x1000,0,sh_off,0,EHSZ,0,0,SHSZ,nsh,4)
+    return eh+shdrs+symtab+strtab+shstr
+open(sys.argv[3],'wb').write(build('>' if sys.argv[1]=='be' else '<', int(sys.argv[2])))
+PY
+  BE="$(mktemp /tmp/flowref-be.XXXXXX)"; LE="$(mktemp /tmp/flowref-le.XXXXXX)"
+  python3 "$GEN" be 21 "$BE"; python3 "$GEN" le 62 "$LE"
+  "$BIN" list "$BE" --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["endian"]=="BE" and d["arch"]=="ppc64", d; f=d["functions"][0]; assert f["name"]=="myfunc" and f["vaddr"]==0x1000 and f["size"]==0x20, f' \
+    || { rm -f "$GEN" "$BE" "$LE"; fail "big-endian ELF parse (byte-swap) wrong"; }
+  pass "big-endian ELF parsed correctly (byte-swap: ppc64 BE, myfunc @0x1000)"
+  "$BIN" list "$LE" --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["functions"][0]; assert d["endian"]=="LE" and f["vaddr"]==0x1000 and f["size"]==0x20, d' \
+    || { rm -f "$GEN" "$BE" "$LE"; fail "little-endian twin parse wrong"; }
+  pass "little-endian twin recovers identical vaddr/size (no-swap path)"
+  rm -f "$GEN" "$BE" "$LE"
+else
+  echo "skip: python3 not available for ELF fixture generation"
+fi
+# Non-ELF containers get a kind-specific message (PE / Mach-O / archive).
+# `list` exits non-zero here, so capture with `|| true` (set -o pipefail).
+printf 'MZ\x90\x00' > /tmp/flowref-pe.$$
+PEMSG="$("$BIN" list /tmp/flowref-pe.$$ 2>&1 || true)"
+rm -f /tmp/flowref-pe.$$
+case "$PEMSG" in
+  *PE/COFF*) pass "non-ELF container identified by kind (PE/COFF) in the error" ;;
+  *) fail "PE not identified in message: $PEMSG" ;;
+esac
+
 echo
 echo "ALL TESTS PASSED"

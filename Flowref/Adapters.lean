@@ -110,8 +110,7 @@ resolved — the untrusted-input boundary, same as the other adapters. -/
 def elfResolveRegion (bin target : String) (archOverride? : Option String) : IO ElfRegion := do
   match ← readElf bin with
   | none =>
-    throw (IO.userError
-      s!"'{bin}' is not a readable ELF; use the explicit-region form (arch fileOff vaddr len) for raw blobs")
+    throw (IO.userError (← notElfMessage bin))
   | some info =>
     match info.resolve target with
     | .error msg => throw (IO.userError msg)

@@ -133,6 +133,36 @@ def parseElfDump (dump : String) : Option ElfInfo := Id.run do
 def readElf (path : String) : IO (Option ElfInfo) :=
   pure (parseElfDump (elfDumpRaw path))
 
+/-- Identify a non-ELF container by its magic bytes, for a helpful error when
+the ELF path fails — flowref reads ELF only, so PE/Mach-O/archive inputs should
+say *what* they are and point at the explicit-region form. Returns a short
+phrase like `"a PE/COFF (Windows) binary"`, or `"not an ELF"` if unrecognised
+(or the file can't be read). -/
+def containerHint (path : String) : IO String := do
+  let head ← try
+      let bytes ← IO.FS.readBinFile (path : System.FilePath)
+      pure (bytes.extract 0 (min 4 bytes.size))
+    catch _ => pure ByteArray.empty
+  let hl := head.toList
+  let b := fun i => hl.getD i 0
+  if head.size ≥ 2 ∧ b 0 == 0x4D ∧ b 1 == 0x5A then
+    pure "a PE/COFF (Windows) binary"
+  else if head.size ≥ 4 ∧
+      ((b 0 == 0xFE ∧ b 1 == 0xED ∧ b 2 == 0xFA ∧ (b 3 == 0xCE ∨ b 3 == 0xCF)) ∨  -- Mach-O 32/64
+       (b 0 == 0xCF ∧ b 1 == 0xFA ∧ b 2 == 0xED ∧ b 3 == 0xFE) ∨                   -- Mach-O 64 LE
+       (b 0 == 0xCA ∧ b 1 == 0xFE ∧ b 2 == 0xBA ∧ b 3 == 0xBE)) then              -- Mach-O fat
+    pure "a Mach-O (macOS) binary"
+  else if head.size ≥ 4 ∧ b 0 == 0x21 ∧ b 1 == 0x3C ∧ b 2 == 0x61 ∧ b 3 == 0x72 then
+    pure "a static archive (.a / ar)"
+  else
+    pure "not an ELF"
+
+/-- A full "not a readable ELF" message for `path`, naming the container kind
+(PE/Mach-O/…) when recognised and pointing at the explicit-region fallback. -/
+def notElfMessage (path : String) : IO String := do
+  let hint ← containerHint path
+  pure s!"'{path}' is {hint}; flowref reads ELF only — use the explicit-region form (arch fileOff vaddr len)"
+
 /-- The section whose `[addr, addr+size)` (allocated, non-zero addr) contains
 `vaddr` — i.e. how a load address maps back to a file offset. -/
 def ElfInfo.sectionAt (e : ElfInfo) (vaddr : Nat) : Option ElfSection :=
