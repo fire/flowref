@@ -31,13 +31,6 @@ require plausible from git
 require «lean-capstone» from git
   "https://github.com/fire/lean-capstone" @ "main"
 
--- DuckDB binding: Parquet (+ zstd) read/write and SQL, used to normalise the
--- Decompile-Bench corpus into ETNF relations (see `Etnf.lean`). `lake update`
--- runs the dep's post_update hook, which vendors `libduckdb.so` into
--- `.lake/packages/lean_duckdb/vendor/` (linked by `flowref-etnf` below).
-require lean_duckdb from git
-  "https://github.com/v-sekai-multiplayer-fabric/lean-duckdb" @ "main"
-
 @[default_target] lean_lib Flowref where
   -- pick up Flowref.lean and every Flowref/*.lean submodule.
   globs := #[.one `Flowref, .submodules `Flowref]
@@ -54,34 +47,3 @@ require lean_duckdb from git
     "-Wl,--end-group"]
     -- The ELF parser is the self-contained `<elf.h>` shim (`libelfshim` extern_lib,
     -- linked transitively) — no external library.
-
-/-! ## Equivalence oracle FFI (`flowref-equiv`).
-    `ffi/equiv_dl.c` dlopen's a compiled (reference, candidate) pair so the Lean
-    `EquivCheck` exe can run a plausible counterexample search over their inputs. -/
-target equivDlO pkg : FilePath := do
-  let oFile := pkg.buildDir / "ffi" / "equiv_dl.o"
-  let srcJob ← inputTextFile <| pkg.dir / "ffi" / "equiv_dl.c"
-  let weakArgs := #["-I", (← getLeanIncludeDir).toString]
-  buildO oFile srcJob weakArgs #["-fPIC", "-O2"] "cc" getLeanTrace
-
-extern_lib libequivdl pkg := do
-  let name := nameToStaticLib "equivdl"
-  let oJob ← equivDlO.fetch
-  buildStaticLib (pkg.staticLibDir / name) #[oJob]
-
--- The equivalence oracle, in Lean: runs `flowref decompile` for the candidate,
--- compiles the pair, and dlopens it (`-ldl`) for the plausible search. It uses
--- only the pure kernel + plausible, so it needs no Capstone archive.
-@[default_target] lean_exe «flowref-equiv» where
-  root := `EquivCheck
-  moreLinkArgs := #["-ldl"]
-
--- ETNF normaliser: reads Decompile-Bench rows (ndjson) and writes redundancy-free
--- Parquet relations (zstd) via DuckDB. Links the vendored libduckdb.so (Lake does
--- not propagate a dependency's moreLinkArgs, so we repeat them here per the
--- lean-duckdb README).
-lean_exe «flowref-etnf» where
-  root := `Etnf
-  moreLinkArgs := #[
-    "-L.lake/packages/lean_duckdb/vendor", "-lduckdb",
-    "-Wl,-rpath,$ORIGIN/../../packages/lean_duckdb/vendor"]

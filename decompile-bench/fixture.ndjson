@@ -1,6 +1,0 @@
-{"name": "add", "code": "int add(int a, int b){ return a + b; }", "asm": "movl %edi, %eax\naddl %esi, %eax\nretq", "file": "/proj/math.c"}
-{"name": "sub", "code": "int sub(int a, int b){ return a - b; }", "asm": "movl %edi, %eax\nsubl %esi, %eax\nretq", "file": "/proj/math.c"}
-{"name": "seven", "code": "int seven(void){ return 7; }", "asm": "movl $7, %eax\nretq", "file": "/proj/util.c"}
-{"name": "seven_again", "code": "int seven(void){ return 7; }", "asm": "movl $7, %eax\nretq", "file": "/proj/util.c"}
-{"name": "noop", "code": "void noop(void){ }", "asm": "retq", "file": "/proj/util.c"}
-{"name": "id", "code": "int id(int x){ return x; }", "asm": "movl %edi, %eax\nretq", "file": "/proj/other/id.c"}
