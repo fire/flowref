@@ -33,6 +33,19 @@ private def archIO (archS : String) : IO A :=
   | some a => pure a
   | none   => throw (IO.userError s!"unsupported arch '{archS}' (expected: x86 | ppc)")
 
+/-- The decode **width** of a Capstone `Mode`: 64-bit iff the `b64` flag is set,
+else 32-bit. (`b16` is treated as 32-bit for parameter-model purposes — there is
+no 16-bit calling convention modelled.) Used to pick SysV vs cdecl. -/
+def bitsOfMode (m : Capstone.Mode) : Bits :=
+  if (m.bits &&& Capstone.Mode.b64.bits) != 0 then .b64 else .b32
+
+/-- Decode width implied by an arch string (via `capstoneSpec?`), defaulting to
+32-bit for arch names without a Capstone spec. -/
+def bitsOfArchString (s : String) : Bits :=
+  match capstoneSpec? s with
+  | some (_, m, _) => bitsOfMode m
+  | none           => .b32
+
 /-- **Binary-file source adapter.** Validate the request, read the region, decode
 with Capstone. Every field is checked before any work: arch supported, numeric
 fields parse strictly and are non-negative, and `[fileOff, fileOff+len)` lies
@@ -55,7 +68,7 @@ def binaryFileAdapter (bin archS foS vaS lenS : String) : SourceAdapter where
     if fo + len > d.size then
       throw (IO.userError
         s!"region [0x{hex fo}, 0x{hex (fo+len)}) extends past end of file (size 0x{hex d.size})")
-    pure (fam, capstoneDecodeBytes carch cmode (d.extract fo (fo + len)) va)
+    pure (fam, bitsOfMode cmode, capstoneDecodeBytes carch cmode (d.extract fo (fo + len)) va)
 
 /-- **Decompile-Bench bins adapter.** A sample from `decompile-bench-bins` is a
 real ELF/PE; decode a supplied function region with Capstone, exactly like
@@ -72,7 +85,7 @@ def asmStringAdapter (archS listing : String) : SourceAdapter where
     let insns := asmDecoder.decode a listing
     if insns.isEmpty then
       throw (IO.userError "assembly listing decoded to zero instructions (unrecognised format?)")
-    pure (a, insns)
+    pure (a, bitsOfArchString archS, insns)
 
 /-- **Assembly-text adapter (from a file).** Read an objdump-style listing file
 and decode it. -/
@@ -84,11 +97,11 @@ def asmFileAdapter (archS path : String) : SourceAdapter where
     let insns := asmDecoder.decode a listing
     if insns.isEmpty then
       throw (IO.userError s!"assembly listing '{path}' decoded to zero instructions (unrecognised format?)")
-    pure (a, insns)
+    pure (a, bitsOfArchString archS, insns)
 
 /-- Back-compatible thin wrapper over `binaryFileAdapter` — the historical
 `load` entry point, now expressed through the port. -/
-def load (bin archS foS vaS lenS : String) : IO (A × Array Ins) :=
+def load (bin archS foS vaS lenS : String) : IO (A × Bits × Array Ins) :=
   (binaryFileAdapter bin archS foS vaS lenS).run
 
 end Flowref

@@ -1,4 +1,5 @@
 import Flowref.Disasm
+import Flowref.Params
 
 /-! # flowref — hexagonal ports (the boundary of the analysis kernel)
 
@@ -53,7 +54,10 @@ rather than silently analysing the wrong region. -/
 structure SourceAdapter where
   /-- Human label, e.g. `"binary-file"`, `"asm-text"`. -/
   name : String
-  /-- Run the adapter: fetch + decode, or fail with a clear `IO.userError`. -/
-  run  : IO (A × Array Ins)
+  /-- Run the adapter: fetch + decode, or fail with a clear `IO.userError`.
+  Yields the kernel arch family, the decode **width** (`Bits`, needed by the
+  calling-convention parameter model to pick SysV vs cdecl), and the decoded
+  instructions. -/
+  run  : IO (A × Bits × Array Ins)
 
 end Flowref

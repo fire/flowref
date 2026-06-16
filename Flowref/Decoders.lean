@@ -189,7 +189,7 @@ private def stripSuffix (mn : String) : String :=
   else match mn.toList.getLast? with
     | some c =>
       if c == 'b' ∨ c == 'w' ∨ c == 'l' ∨ c == 'q' then
-        let stem := mn.dropRight 1
+        let stem := (mn.dropEnd 1).toString
         if attStems.contains stem then stem else mn
       else mn
     | none => mn

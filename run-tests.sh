@@ -48,6 +48,22 @@ echo "$out" | grep -q "L0 (walkSteps=64.*UNRESOLVED" || fail "L0 should be unres
 echo "$out" | grep -q "L1 (walkSteps=512.*RESOLVED"   || fail "L1 should resolve"
 pass "shallow L0 unresolved; deepened L1 resolves"
 
+echo "== 6b. calling-convention parameter model (SysV x86-64 + cdecl x86-32) =="
+pout="$("$BIN" --demo-params)"
+echo "$pout"
+echo "$pout" | grep -q "uint32_t sub_401000(uint32_t a0, uint32_t a1)" \
+  || fail "SysV x86-64 demo should recover a 2-parameter signature"
+echo "$pout" | grep -q "uint32_t sub_401100(uint32_t a0)" \
+  || fail "cdecl x86-32 demo should recover a 1-parameter signature"
+pass "recovered 2-param SysV + 1-param cdecl signatures"
+# the emitted C (both functions) must compile.
+"$BIN" --demo-params --emit-c | "$GCC" -xc -std=c11 -w -fsyntax-only - \
+  || fail "parameter-model demo C does not compile (-fsyntax-only)"
+# and the body must actually bind the incoming arg to the parameter name.
+"$BIN" --demo-params --emit-c | grep -q "eax_0 = (uint32_t)(a0)" \
+  || fail "parameter binding (a0) not threaded into the SSA body"
+pass "parameter-model C compiles and binds args to a0/a1"
+
 echo "== 7. real-function decompile compiles (if test binary present) =="
 REALBIN="${FLOWREF_REALBIN:-/tmp/hdkout/app/dev/bin/HUBAtgiToAnim.exe}"
 if [ -f "$REALBIN" ]; then

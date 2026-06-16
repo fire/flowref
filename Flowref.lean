@@ -26,7 +26,9 @@ The emitter (`Flowref/Emit.lean`) lowers the recovered facts into C that
 open Plausible Flowref
 
 /-- Version string. -/
-def flowrefVersion : String := "flowref 1.0.0"
+def flowrefVersion : String :=
+  "flowref 1.1.0 — control-flow-aware xref + plausible-driven decompiler with a " ++
+  "calling-convention parameter model (SysV x86-64 + cdecl x86-32)"
 
 /-- Full usage text. -/
 def usageText : String :=
@@ -38,6 +40,8 @@ def usageText : String :=
   "  flowref xref-asm      <listing> <arch> <targetHex>  [--search-trace]   (objdump-style .asm text)\n" ++
   "  flowref --demo [--emit-c] [--search-trace]\n" ++
   "  flowref --demo-deep   (iterative-deepening escalation demonstration)\n" ++
+  "  flowref --demo-params [--emit-c]  (calling-convention parameter-model demo:\n" ++
+  "                  SysV x86-64 2-param + cdecl x86-32 1-param recovered signatures)\n" ++
   "  flowref <binary> <arch> <targetHex> <fileOffHex> <vaddrHex> <lenHex>   (legacy xref)\n" ++
   "  flowref --help | -h | --version\n\n" ++
   "ARGS:\n" ++
@@ -58,7 +62,7 @@ def usageText : String :=
 /-- Build the full compilable C translation unit for a function. Returns the C
 text plus the search trace. `verbose`/header comments are part of the C as
 comments (still C-legal). -/
-def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEntry) := do
+def emitC (a : A) (bits : Bits) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEntry) := do
   let nI := insns.size
   if nI == 0 then
     pure (cPreamble ++ "uint32_t sub_" ++ hex fnVa ++ "(void) { return 0; }\n", #[])
@@ -66,6 +70,39 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
   -- address → index
   let mut addr2idx : Std.HashMap Nat Nat := {}
   for i in [0:nI] do addr2idx := addr2idx.insert insns[i]!.addr i
+
+  -- ===== Pass 0: calling-convention parameter model =====
+  -- Recover the function's integer/pointer parameters from the calling
+  -- convention chosen by (arch, width): SysV AMD64 for x86-64, cdecl for x86-32.
+  -- This is what turns `sub_X(void)` into a real signature. See Flowref/Params.lean.
+  let pm ← recoverParams a bits insns addr2idx
+  -- The C parameter list, e.g. "uint32_t a0, uint32_t a1" (or "void").
+  let paramList :=
+    if pm.count == 0 then "void"
+    else String.intercalate ", " (pm.names.map (fun nm => s!"uint32_t {nm}"))
+  -- SysV: incoming arg registers bind to parameter names (a parameter is a
+  -- def-at-entry); this is injected directly into the SSA use map in Pass 2
+  -- below (the `[]`-reaching-def case), reusing the existing register-
+  -- substitution path in `renderExprC` (so `mov eax, edi` → `eax = a0`).
+  -- cdecl: incoming args are stack slots `[ebp+8]`/`[esp+4]`. After SSA/mem
+  -- lowering a slot reads as `*(uint32_t*)((uintptr_t)(ebp + 8))`; we rewrite
+  -- that exact C text to the parameter name `a{k}` as a final pass. Build the
+  -- (needle, paramName) pairs once.
+  let cdeclSlotRewrites : List (String × String) :=
+    if pm.conv == .cdecl then
+      -- Capstone may print the displacement in decimal (`ebp + 8`) or hex
+      -- (`ebp + 0x8`); cover both forms of the lowered C text.
+      (List.range pm.count).flatMap (fun k =>
+        let eD := (cdeclEbpDisp k).toNat
+        let sD := (cdeclEspDisp k).toNat
+        [ (memToC s!"[ebp + {eD}]",       s!"a{k}"),
+          (memToC s!"[ebp + 0x{hex eD}]", s!"a{k}"),
+          (memToC s!"[esp + {sD}]",       s!"a{k}"),
+          (memToC s!"[esp + 0x{hex sD}]", s!"a{k}") ])
+    else []
+  let applyCdecl := fun (s : String) =>
+    cdeclSlotRewrites.foldl (fun acc (needle, nm) =>
+      String.intercalate nm (acc.splitOn needle)) s
 
   -- ===== Pass 1: CFG (plain structural code) =====
   let mut isLeader : Array Bool := Array.replicate nI false
@@ -138,7 +175,14 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
       let (defsR, _lvl, te) ← resolveReachingDef insns addr2idx a j r
       trace := trace.push te
       match defsR with
-      | [] => pure ()  -- argument / unknown source: leave as `r` (declared as a local).
+      | [] =>
+        -- No reaching def inside the function ⇒ the value comes from the caller.
+        -- Under SysV this read is live-on-entry: if `r` is an in-range arg
+        -- register, bind it to its parameter name `a{k}` (a parameter is a
+        -- def-at-entry). This is the same `[]`-witness the param model uses.
+        match sysvParamForReg pm.count r with
+        | some nm => useToVer := useToVer.insert j (((useToVer.get? j).getD []) ++ [(r, nm)])
+        | none    => pure ()  -- genuine unknown source: leave as `r` (a local).
       | [only] =>
         let nm := cName ((ssaName.get? only).getD r)
         useToVer := useToVer.insert j (((useToVer.get? j).getD []) ++ [(r, nm)])
@@ -174,9 +218,11 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
       | [] => false
       | c :: _ => (('a' ≤ c && c ≤ 'z') || ('A' ≤ c && c ≤ 'Z') || c == '_'))
   let mut declSet : Std.HashMap String String := {}   -- cName → ctype
+  -- Parameter names (`a0..aN`) are function arguments, not locals — never
+  -- re-declare them (that would shadow/redefine the parameter and break compile).
   let declAdd := fun (m : Std.HashMap String String) (nm ty : String) =>
     let cn := cName nm
-    if okLocal cn then m.insert cn ty else m
+    if okLocal cn ∧ ¬ pm.names.contains cn then m.insert cn ty else m
   -- all SSA defs
   for (i, r) in defSites do
     let nm := (ssaName.get? i).getD r
@@ -225,11 +271,17 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
   out := out ++ s!"\n/* flowref decompile @ 0x{hex fnVa}\n"
   out := out ++ s!"   {nI} insns, {nB} basic blocks, {defSites.size} SSA defs\n"
   out := out ++ s!"   loop headers (plausible back-edge: {loopRes.isFailure}): {loopHeaders}\n"
-  out := out ++ s!"   if/else conditional blocks: {condBlocks} */\n\n"
-  -- forward prototypes
+  out := out ++ s!"   if/else conditional blocks: {condBlocks}\n"
+  out := out ++ s!"   calling convention: {repr pm.conv}, recovered params: {pm.count} ({pm.names}) */\n\n"
+  -- forward prototypes. We know a callee's parameter count only for the function
+  -- itself (self-recursion); other callees are declared `(void)` (unknown arity)
+  -- — see Flowref/Params.lean on the limits.
   for t in calledSubs.toList do
-    out := out ++ s!"uint32_t sub_{hex t}(void);\n"
-  out := out ++ "\nuint32_t sub_" ++ hex fnVa ++ "(void) {\n"
+    if t == fnVa ∧ pm.count > 0 then
+      out := out ++ s!"uint32_t sub_{hex t}({paramList});\n"
+    else
+      out := out ++ s!"uint32_t sub_{hex t}(void);\n"
+  out := out ++ "\nuint32_t sub_" ++ hex fnVa ++ s!"({paramList}) " ++ "{\n"
   -- declarations
   for (nm, ty) in declSet.toList do
     out := out ++ s!"  {ty} {nm} = 0;\n"
@@ -288,7 +340,7 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
                 s!"((int32_t)({lx}) {op} (int32_t)({ly}))"
             | _ => "/* unknown predicate */ 1"
           | none => "/* no cmp found; flag-based predicate unknown */ 1"
-        out := out ++ s!"  cond_{ci} = {pred};\n"
+        out := out ++ s!"  cond_{ci} = {applyCdecl pred};\n"
         match branchTarget a ins with
         | some t =>
           let tl := match addr2idx[t]? with | some jj => s!"L{idx2blk[jj]!}" | none => s!"/*ext 0x{hex t}*/L{b}_skip"
@@ -304,8 +356,12 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
         match branchTarget a ins with
         | some t =>
           if (addr2idx[t]?).isSome ∨ true then
-            -- direct call: prototype forward-declared above (or external).
-            out := out ++ s!"  {cName retReg} = sub_{hex t}();\n"
+            -- direct call: prototype forward-declared above (or external). When
+            -- the callee's parameter count is recoverable (self-recursion), pass
+            -- the right number of arguments; otherwise a no-arg call.
+            let args :=
+              if t == fnVa ∧ pm.count > 0 then String.intercalate ", " pm.names else ""
+            out := out ++ s!"  {cName retReg} = sub_{hex t}({args});\n"
         | none =>
           -- indirect/computed call: cast through a function pointer; C-legal.
           out := out ++ s!"  ((uint32_t(*)(void))(uintptr_t)0)(); /* indirect call {ins.ops} */\n"
@@ -319,7 +375,7 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
           -- an lvalue — keep the unit compilable by dropping to a comment.
           if okLocal nm then
             let subs := (useToVer.get? q).getD []
-            let rhs := renderExprC a ins subs
+            let rhs := applyCdecl (renderExprC a ins subs)
             out := out ++ s!"  {nm} = ({regCType r})({rhs});\n"
           else
             out := out ++ s!"  /* {ins.mn} {ins.ops} (non-register destination) */\n"
@@ -343,8 +399,8 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
   pure (out, trace)
 
 /-- Pretty (commented) decompile to stdout, plus optional trace to stderr. -/
-def decompileInsns (a : A) (insns : Array Ins) (fnVa : Nat) (showTrace : Bool) : IO Unit := do
-  let (c, trace) ← emitC a insns fnVa
+def decompileInsns (a : A) (bits : Bits) (insns : Array Ins) (fnVa : Nat) (showTrace : Bool) : IO Unit := do
+  let (c, trace) ← emitC a bits insns fnVa
   IO.print c
   if showTrace then
     IO.eprintln "=== iterative-deepening search trace ==="
@@ -406,6 +462,60 @@ def demoDeep : IO Unit := do
   IO.println s!"\nAdaptive driver resolved esi@use at level L{lvl} with def(s) {defs}."
   IO.println "The shallow L0 search could NOT resolve it (budget hit); deepening did."
 
+/-! ## Parameter-model demo (calling conventions)
+
+Two synthetic functions exercise the parameter recovery:
+
+* **x86-64 / System V** — `mov eax, edi ; add eax, esi ; ret`. Reads `edi`
+  (arg0) and `esi` (arg1), both live-on-entry ⇒ 2 parameters.
+* **x86-32 / cdecl** — standard prologue then `mov eax, [ebp + 8] ; …; ret`.
+  Reads the first stack slot ⇒ 1 parameter.
+
+The demo prints the recovered C signature for each (which `--demo-params --emit-c`
+emits raw so it can be piped to a compiler). -/
+
+/-- x86-64 SysV: `mov eax, edi ; add eax, esi ; ret` — uses arg0 (`edi`) and
+arg1 (`esi`). -/
+def demoSysvInsns : Array Ins :=
+  let bytes : ByteArray := ByteArray.mk #[
+    0x89, 0xF8,   -- mov eax, edi
+    0x01, 0xF0,   -- add eax, esi
+    0xC3 ]        -- ret
+  capstoneDecodeBytes Capstone.Arch.x86 Capstone.Mode.b64 bytes 0x401000
+
+/-- x86-32 cdecl: `push ebp ; mov ebp,esp ; mov eax,[ebp+8] ; pop ebp ; ret`
+— reads the first cdecl stack slot ⇒ 1 parameter. -/
+def demoCdeclInsns : Array Ins :=
+  let bytes : ByteArray := ByteArray.mk #[
+    0x55,               -- push ebp
+    0x89, 0xE5,         -- mov ebp, esp
+    0x8B, 0x45, 0x08,   -- mov eax, [ebp + 8]
+    0x5D,               -- pop ebp
+    0xC3 ]              -- ret
+  capstoneDecodeBytes Capstone.Arch.x86 Capstone.Mode.b32 bytes 0x401100
+
+/-- Run the parameter-model demo. With `emitC?` print only the C (for both
+functions) so it can be piped to a compiler; otherwise print a human report. -/
+def demoParams (emitC? : Bool) : IO Unit := do
+  let (sysvC, _) ← emitC .x86 .b64 demoSysvInsns 0x401000
+  let (cdeclC, _) ← emitC .x86 .b32 demoCdeclInsns 0x401100
+  if emitC? then
+    -- Two functions in one TU; rename the cdecl one so symbols don't collide.
+    IO.print sysvC
+    IO.print (String.intercalate "sub_401100b" (cdeclC.splitOn "sub_401100"))
+  else
+    IO.println "=== parameter-model demo: SysV x86-64 (2 params) ==="
+    IO.println "synthetic: mov eax, edi ; add eax, esi ; ret"
+    let sig := (sysvC.splitOn "\nuint32_t sub_401000").getLastD ""
+    IO.println s!"recovered signature: uint32_t sub_401000{(sig.splitOn ")").headD ""})"
+    IO.println ""
+    IO.println "=== parameter-model demo: cdecl x86-32 (1 param) ==="
+    IO.println "synthetic: push ebp; mov ebp,esp; mov eax,[ebp+8]; pop ebp; ret"
+    let sig2 := (cdeclC.splitOn "\nuint32_t sub_401100").getLastD ""
+    IO.println s!"recovered signature: uint32_t sub_401100{(sig2.splitOn ")").headD ""})"
+    IO.println ""
+    IO.println "(pipe `flowref --demo-params --emit-c` to gcc to confirm it compiles)"
+
 def main (args : List String) : IO Unit := do
   let hasFlag := fun (f : String) => args.contains f
   let showTrace := hasFlag "--search-trace"
@@ -416,9 +526,10 @@ def main (args : List String) : IO Unit := do
   if hasFlag "--help" ∨ hasFlag "-h" then IO.println usageText; return
   if hasFlag "--version" then IO.println flowrefVersion; return
   if hasFlag "--demo-deep" then demoDeep; return
+  if hasFlag "--demo-params" then demoParams (hasFlag "--emit-c"); return
   if hasFlag "--demo" then
     if hasFlag "--emit-c" then
-      let (c, trace) ← emitC .x86 demoInsns 0x1000
+      let (c, trace) ← emitC .x86 .b32 demoInsns 0x1000
       IO.print c
       if showTrace then
         IO.eprintln "=== iterative-deepening search trace (demo) ==="
@@ -427,7 +538,7 @@ def main (args : List String) : IO Unit := do
       IO.println "=== synthetic disassembly (x86, base 0x1000) ==="
       for i in demoInsns do IO.println s!"  0x{hex i.addr}: {i.mn} {i.ops}"
       IO.println ""
-      decompileInsns .x86 demoInsns 0x1000 showTrace
+      decompileInsns .x86 .b32 demoInsns 0x1000 showTrace
     return
   match positional with
   -- ── decompile ──────────────────────────────────────────────────────────
@@ -455,16 +566,16 @@ where
     let fnVa ← match parseImm? fnS with
       | some v => if v < 0 then throw (IO.userError s!"fnVaddr must be non-negative, got '{fnS}'") else pure v.toNat
       | none => throw (IO.userError s!"invalid fnVaddr '{fnS}' (expected hex like 0x401010 or a decimal)")
-    let (a, insns) ← adapter.run
+    let (a, bits, insns) ← adapter.run
     if insns.isEmpty then IO.eprintln "error: empty disassembly for the given region"; IO.Process.exit 3
-    decompileInsns a insns fnVa showTrace
+    decompileInsns a bits insns fnVa showTrace
   /-- The ORIGINAL behaviour: a single-target def→use witness search, now with
   iterative deepening over the CFG-walk budget, over any `SourceAdapter`. -/
   xref (adapter : SourceAdapter) (tgtS : String) (showTrace : Bool) : IO Unit := do
     let target : Int ← match parseImm? tgtS with
       | some v => pure v
       | none => throw (IO.userError s!"invalid target '{tgtS}' (expected hex like 0x401010 or a decimal)")
-    let (a, insns) ← adapter.run
+    let (a, _bits, insns) ← adapter.run
     if insns.isEmpty then IO.eprintln "error: empty disassembly for the given region"; IO.Process.exit 3
     let nI := insns.size
     let mut addr2idx : Std.HashMap Nat Nat := {}

@@ -30,6 +30,7 @@ deliberate trade-off (see *Limitations*).
 | `flowref --demo` | Synthetic `if` + counting-loop self-test (no disk). |
 | `flowref --demo --emit-c` | Print only the C translation unit for the demo (pipe to a compiler). |
 | `flowref --demo-deep` | Demonstrate iterative-deepening escalation. |
+| `flowref --demo-params [--emit-c]` | Demonstrate calling-convention parameter recovery (SysV x86-64 2-param + cdecl x86-32 1-param). |
 | `flowref --help` / `-h` | Full usage. |
 | `flowref --version` | Version string. |
 
@@ -83,7 +84,8 @@ one new adapter — neither touches the kernel. See `Flowref/Ports.lean`.
 `decompile` (and `--demo --emit-c`) emit a self-contained C11 translation unit:
 
 * `#include <stdint.h>` + typedefs, forward prototypes for every called
-  `sub_*`, and a real `uint32_t sub_<addr>(void) { … }` definition.
+  `sub_*`, and a real `uint32_t sub_<addr>(…)` definition whose **parameter
+  list is recovered from the calling convention** (see below).
 * Every SSA value is declared up front as a width-typed local
   (`uint8_t`/`uint16_t`/`uint32_t`/`uint64_t`) with a C-legal name (`reg_version`).
 * Memory operands become real C: `*(uint32_t*)((uintptr_t)(esi + 4))`.
@@ -93,6 +95,53 @@ one new adapter — neither touches the kernel. See `Flowref/Ports.lean`.
 * Control flow is **labels + `goto`** (always valid C), with conditions built
   from the compare + branch (`if (cond_0) goto L4;`, where `cond_0` is a
   declared, documented boolean temp).
+
+## Parameter recovery (calling conventions)
+
+Without a calling convention a decompiler cannot know a function's *signature*,
+so it falls back to `uint32_t sub_X(void)`. `flowref` recovers the
+integer/pointer **parameters** from the platform ABI (chosen from the decode
+arch/width) and emits a real prototype `uint32_t sub_X(uint32_t a0, uint32_t a1,
+…)`, binds the incoming registers/stack-slots to those parameter names in the
+SSA body, and — where a callee's arity is recoverable — passes the right number
+of arguments at the call site.
+
+* **x86-64 — System V AMD64.** Integer/pointer arguments arrive in
+  `rdi, rsi, rdx, rcx, r8, r9` (then the stack, unmodelled). Parameter `k` is
+  *used* when that argument register (any width alias: `rdi`/`edi`/`di`/`dil`, …)
+  is **live on entry** — read before it is written. This is recovered with the
+  *same* plausible-driven, iteratively-deepened reaching-def search the rest of
+  the tool uses: an argument-register read with an **empty reaching-def set** is
+  fed by the caller, i.e. it *is* a parameter. The count is the highest
+  **consecutive** live arg register.
+
+* **x86-32 — cdecl.** Integer arguments live on the stack: `[ebp + 8]`,
+  `[ebp + 0xC]`, … after the standard `push ebp; mov ebp, esp` prologue (or
+  `[esp + 4]`, `[esp + 8]`, … without a frame pointer). Parameter `k` is *used*
+  when its slot is read (via the kernel's `useDisp` displacement reader). The
+  count is the highest consecutive slot read.
+
+```bash
+$ flowref --demo-params
+=== parameter-model demo: SysV x86-64 (2 params) ===
+synthetic: mov eax, edi ; add eax, esi ; ret
+recovered signature: uint32_t sub_401000(uint32_t a0, uint32_t a1)
+
+=== parameter-model demo: cdecl x86-32 (1 param) ===
+synthetic: push ebp; mov ebp,esp; mov eax,[ebp+8]; pop ebp; ret
+recovered signature: uint32_t sub_401100(uint32_t a0)
+
+$ flowref --demo-params --emit-c | gcc -xc -std=c11 -w -fsyntax-only -   # exits 0
+```
+
+**Honest limits.** Integer/pointer arguments only — no floating-point/SSE
+arguments (xmm under SysV), no struct-by-value, no varargs. The parameter count
+is a **heuristic**: the highest *consecutive* live-on-entry arg register (SysV)
+or read stack slot (cdecl). A function that genuinely skips an argument
+register, or only conditionally touches a later argument, can be under- or
+mis-counted. Callee arity at a call site is known only for self-recursion;
+other callees are declared `(void)`. This is a recovery aid, not a ground-truth
+signature.
 
 ### Example — verified to compile
 
@@ -211,6 +260,7 @@ builds Capstone from source.
 |---|---|---|
 | `Flowref/Disasm.lean` | Instruction model, per-arch patterns, CFG carving. | kernel |
 | `Flowref/Dataflow.lean` | Plausible-driven reaching defs + iterative-deepening DAG. | kernel |
+| `Flowref/Params.lean` | Calling-convention parameter model (SysV x86-64 + cdecl x86-32). | kernel |
 | `Flowref/Emit.lean` | Compilable-C name/type/operand lowering. | kernel |
 | `Flowref/Ports.lean` | `Decoder` + `SourceAdapter` port definitions. | ports |
 | `Flowref/Decoders.lean` | Capstone byte decoder, objdump-asm text decoder, `capstoneSpec?` (all arches). | adapters |
