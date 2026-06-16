@@ -1,18 +1,23 @@
-import Capstone
+/-! # flowref — instruction model (the analysis **kernel**, decoder-agnostic)
 
-/-! # flowref — disassembly + instruction model
-
-This module holds the architecture-neutral instruction model and the
-pattern-based helpers (def / use / clobber / branch-target) that the data-flow
-search and the emitter consume. It is plain structural code: parsing and
-carving the CFG are *not* data-flow, so they need no search.
+This module is the interior of the hexagon: the architecture-neutral
+instruction model (`Ins`, `A`, `BB`) and the pattern-based helpers
+(def / use / clobber / branch-target) that the data-flow search and the emitter
+consume. It is plain structural code with **no I/O and no dependency on
+Capstone** — it speaks only the `Ins` model, and never knows whether those
+instructions were decoded from machine-code bytes, an objdump listing, or a
+dataset row. Turning raw bytes/text into `Ins` is the job of the *decoders*
+(`Flowref/Decoders.lean`); fetching the bytes/text is the job of the *adapters*
+(`Flowref/Adapters.lean`). See `Flowref/Ports.lean` for the port definitions.
 -/
-
-open Capstone
 
 namespace Flowref
 
-/-- Parse a hex (`0x…`) or decimal integer, optionally signed. -/
+/-- Parse a hex (`0x…`) or decimal integer, optionally signed. Best-effort:
+invalid characters are skipped. Use this for *disassembler-produced* operand
+text, where the input is trusted to be well-formed. For **user-supplied** CLI
+arguments use `parseImm?`, which rejects malformed input instead of silently
+returning a wrong address. -/
 def parseImm (s0 : String) : Int :=
   let s := s0.trimAscii.toString
   let (neg, t) := if s.startsWith "-" then (true, (s.drop 1).toString) else (false, s)
@@ -22,6 +27,27 @@ def parseImm (s0 : String) : Int :=
     else if 'a' ≤ c ∧ c ≤ 'f' then n*16 + (c.toNat - 'a'.toNat + 10)
     else if 'A' ≤ c ∧ c ≤ 'F' then n*16 + (c.toNat - 'A'.toNat + 10) else n) 0
   if neg then -v else v
+
+/-- Strict parse of a hex (`0x…`/`0X…`) or decimal integer, optionally signed.
+Returns `none` on an empty string, a missing digit, or **any** invalid
+character — so a mistyped address (`0xZZ`, `10g`, `--`) is rejected at the CLI
+boundary rather than silently misinterpreted as the wrong region. -/
+def parseImm? (s0 : String) : Option Int :=
+  let s := s0.trimAscii.toString
+  if s.isEmpty then none else
+  let (neg, t0) := if s.startsWith "-" then (true, (s.drop 1).toString) else (false, s)
+  let (isHex, t) :=
+    if t0.startsWith "0x" ∨ t0.startsWith "0X" then (true, (t0.drop 2).toString) else (false, t0)
+  if t.isEmpty then none else
+  let base : Nat := if isHex then 16 else 10
+  let digit? := fun (c : Char) =>
+    if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
+    else if isHex ∧ 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+    else if isHex ∧ 'A' ≤ c ∧ c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
+    else none
+  (t.toList.foldl (fun acc c => match acc, digit? c with
+    | some n, some d => some (n * base + d)
+    | _, _ => none) (some 0)).map (fun n => if neg then -(Int.ofNat n) else Int.ofNat n)
 
 /-- Lower-case hex string of a Nat (no `0x` prefix). -/
 def hex (n : Nat) : String := String.ofList (Nat.toDigits 16 n)
@@ -180,14 +206,15 @@ structure BB where
   succ  : List Nat       -- successor block ids
   deriving Inhabited, Repr
 
-/-- Disassemble a region into our reduced `Ins` array + arch selector. -/
-def load (bin archS foS vaS lenS : String) : IO (A × Array Ins) := do
-  let a : A := if archS == "ppc" then .ppc else .x86
-  let (carch, cmode) := if a == .ppc then (Capstone.Arch.ppc, Mode.b64 ||| Mode.bigEndian) else (Capstone.Arch.x86, Mode.b32)
-  let fo := (parseImm foS).toNat; let va := (parseImm vaS).toNat; let len := (parseImm lenS).toNat
-  let d ← IO.FS.readBinFile (bin : System.FilePath)
-  let insns := (disasm carch cmode (d.extract fo (fo+len)) va).map
-    (fun x => ({ addr := x.addr, mn := x.mnemonic, ops := x.ops } : Ins))
-  pure (a, insns)
+/-- Resolve an arch name to its kernel **pattern family** (the textual
+def/use/branch patterns are shared by all x86 widths). `none` ⇒ unsupported.
+Pure: the adapters that read bytes/text turn `none` into an `IO.userError`.
+The Capstone decode *mode* (32- vs 64-bit) is a separate axis chosen by the
+decoder — see `capstoneSpec?` in `Flowref/Decoders.lean`. -/
+def archOfString? (s : String) : Option A :=
+  match s.trimAscii.toString with
+  | "x86" | "x86-32" | "i386" | "x64" | "x86-64" | "amd64" => some .x86
+  | "ppc" | "ppc64" => some .ppc
+  | _     => none
 
 end Flowref

@@ -27,7 +27,7 @@ This is the project's "chain of conditional witnesses that deepen based on
 evidence — a witness DAG" idea, made literal.
 -/
 
-open Capstone Plausible
+open Plausible
 
 namespace Flowref
 

@@ -36,9 +36,47 @@ deliberate trade-off (see *Limitations*).
 Add `--search-trace` to any analysis command to print the iterative-deepening
 escalation chain to stderr.
 
-`arch` ∈ {`x86` (32-bit), `ppc` (64-bit big-endian)}. The file offset and load
-address are separate arguments because they differ in most executable formats
-(sections map to addresses unrelated to their on-disk position).
+Two more commands ingest an **objdump-style assembly listing** directly (no
+binary), via the asm-text decoder — handy when only a listing is available:
+
+| Command | What it does |
+|---|---|
+| `flowref decompile-asm <listing> <arch> <fnVaddr>` | Lift an Intel-syntax `.asm` listing to C. |
+| `flowref xref-asm <listing> <arch> <target>` | Def→use witnesses over a listing. |
+
+`arch` accepts **every target the vendored Capstone build supports** —
+`x86`, `x64`/`x86-64`, `ppc`/`ppc64`, `arm`, `thumb`, `arm64`, `mips`/`mips64`,
+`sparc`, `systemz`, `riscv`/`riscv64`, `m68k`, `sh`, `bpf`, `wasm`, and more
+(see `capstoneSpec?` in `Flowref/Decoders.lean`). Decoding is universal; the
+data-flow *pattern families* are currently x86 (all widths) and PowerPC, with
+other targets decoding into a compilable stub until a family is added. The file
+offset and load address are separate arguments because they differ in most
+executable formats (sections map to addresses unrelated to their on-disk
+position).
+
+## Architecture — hexagonal ports & adapters
+
+flowref is structured so the analysis never knows where its instructions came
+from:
+
+```
+        adapters (I/O, formats)         decoders (Decoder port)        kernel (pure)
+  binary-file · decompile-bench-bins ─▶ capstone (bytes → Ins) ─┐
+  asm-text (string / file) ──────────▶ objdump-asm (text → Ins)─┴─▶ Disasm · Dataflow · Emit
+```
+
+* **Kernel** — `Flowref/Disasm.lean` (instruction model + per-arch patterns +
+  CFG carving), `Flowref/Dataflow.lean` (plausible-driven reaching defs +
+  iterative deepening), `Flowref/Emit.lean` (compilable-C lowering). Pure domain
+  logic: **no I/O, no Capstone dependency** — it speaks only the `Ins` model.
+* **`Decoder` port** (`Flowref/Decoders.lean`) — the *format* boundary:
+  `capstoneDecoder` (machine-code bytes) and `asmDecoder` (objdump text).
+* **`SourceAdapter` port** (`Flowref/Adapters.lean`) — the *source* boundary and
+  the **untrusted-input validation** layer: `binaryFileAdapter`,
+  `decompileBenchBinAdapter`, `asmStringAdapter`/`asmFileAdapter`.
+
+Adding an architecture is one line in `capstoneSpec?`; adding an input format is
+one new adapter — neither touches the kernel. See `Flowref/Ports.lean`.
 
 ## Proper C output
 
@@ -169,12 +207,44 @@ builds Capstone from source.
 
 ## Module layout
 
-| File | Responsibility |
-|---|---|
-| `Flowref/Disasm.lean` | Instruction model, per-arch patterns, CFG carving (plain code). |
-| `Flowref/Dataflow.lean` | Plausible-driven reaching defs + iterative-deepening DAG. |
-| `Flowref/Emit.lean` | Compilable-C name/type/operand lowering. |
-| `Flowref.lean` | CLI, orchestration, C emission, demos. |
+| File | Responsibility | Hexagon role |
+|---|---|---|
+| `Flowref/Disasm.lean` | Instruction model, per-arch patterns, CFG carving. | kernel |
+| `Flowref/Dataflow.lean` | Plausible-driven reaching defs + iterative-deepening DAG. | kernel |
+| `Flowref/Emit.lean` | Compilable-C name/type/operand lowering. | kernel |
+| `Flowref/Ports.lean` | `Decoder` + `SourceAdapter` port definitions. | ports |
+| `Flowref/Decoders.lean` | Capstone byte decoder, objdump-asm text decoder, `capstoneSpec?` (all arches). | adapters |
+| `Flowref/Adapters.lean` | Binary-file / decompile-bench / asm-text source adapters + input validation. | adapters |
+| `Flowref.lean` | CLI, orchestration, C emission, demos. | composition root |
+
+## Evaluation — Decompile-Bench equivalence
+
+flowref is evaluated against **Decompile-Bench** (Tan, Tian, Qi, et al., 2025),
+a million-scale corpus of binary↔source function pairs. We drive it from the
+**released binaries** (so flowref's own disassembler does the lifting) and prove
+functional **equivalence** of the recovered C against the dataset's source
+`code` by differential execution. A self-contained demonstration:
+
+```text
+$ decompile-bench/equiv-demo.sh
+  k7 …: EQUIVALENT  (both return 7)
+  …
+RESULT: 4/4 proven functionally equivalent to their source.
+```
+
+This holds today for parameterless register-only leaf functions; the harness
+honestly reports `INCOMPARABLE` (distinct from `NOT-EQUIVALENT`) for cases it
+cannot yet model — see `decompile-bench/README.md` for the methodology and the
+open gaps (chiefly: no parameter/ABI model).
+
+## References
+
+See `CITATIONS.bib`. Principally:
+
+* Tan, H., Tian, X., Qi, H., et al. (2025). *Decompile-Bench: Million-Scale
+  Binary-Source Function Pairs for Real-World Binary Decompilation.* arXiv:2505.12668.
+  Dataset: <https://huggingface.co/datasets/LLM4Binary/decompile-bench>
+  (binaries: `decompile-bench-bins`).
 
 ## Limitations (honest scope)
 
@@ -190,12 +260,15 @@ This is a **lead-finder and an MVP decompiler, not Ghidra or Hex-Rays.**
   slow or hit the cap — that is the deliberate trade-off of the plausible-driven
   design, chosen over classical worklist/SSA/dominator algorithms by intent.
 - **Register-level, textual operand model.** Sub-register aliasing
-  (`al`/`ax`/`eax`), memory SSA, and indirect/computed branches are not
-  modelled; φ nodes are detected and lowered but not minimised.
-- **Conservative patterns.** `defOf`/`useDisp`/`clobbers`/`writesReg` are small,
-  auditable rules over Capstone's textual operands; whole-table loads and
-  exotic addressing forms are not yet covered. Adding an architecture is a few
-  lines in `Flowref/Disasm.lean`.
+  (`al`/`ax`/`eax`, `eax`⊂`rax`), memory SSA, and indirect/computed branches are
+  not modelled; φ nodes are detected and lowered but not minimised. There is no
+  parameter / calling-convention model, so emitted functions are `(void)`.
+- **Universal decode, two pattern families.** Every Capstone target decodes
+  (`capstoneSpec?`), but the data-flow patterns
+  (`defOf`/`useDisp`/`clobbers`/`writesReg`) are written for x86 (all widths)
+  and PowerPC; other targets lift to a compilable stub until a family is added.
+  Adding an arch is one line in `capstoneSpec?`; adding a *pattern family* is a
+  kernel change isolated to `Flowref/Disasm.lean`.
 
 ## License
 

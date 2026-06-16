@@ -1,0 +1,18 @@
+% Works that flowref builds on or is evaluated against.
+
+% Evaluation corpus for the `decompile` path: real-world binary↔source function
+% pairs. flowref adopts its re-compilability metric (does the recovered C
+% compile?) over a sample of this dataset — see `decompile-bench/` and the
+% README "Evaluation corpus" section.
+@misc{tan2025decompilebench,
+  title         = {Decompile-Bench: Million-Scale Binary-Source Function Pairs
+                   for Real-World Binary Decompilation},
+  author        = {Tan, H. and Tian, X. and Qi, H. and others},
+  year          = {2025},
+  eprint        = {2505.12668},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SE},
+  doi           = {10.48550/arXiv.2505.12668},
+  url           = {https://doi.org/10.48550/arXiv.2505.12668},
+  note          = {Dataset: \url{https://huggingface.co/datasets/LLM4Binary/decompile-bench}}
+}

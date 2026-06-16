@@ -1,7 +1,9 @@
 import Flowref.Disasm
 import Flowref.Dataflow
 import Flowref.Emit
-import Capstone
+import Flowref.Ports
+import Flowref.Decoders
+import Flowref.Adapters
 import Plausible
 
 /-! # flowref — control-flow-aware xref **and** a plausible-driven decompiler
@@ -21,7 +23,7 @@ The emitter (`Flowref/Emit.lean`) lowers the recovered facts into C that
 `gcc -fsyntax-only -std=c11 -w` accepts.
 -/
 
-open Capstone Plausible Flowref
+open Plausible Flowref
 
 /-- Version string. -/
 def flowrefVersion : String := "flowref 1.0.0"
@@ -30,14 +32,16 @@ def flowrefVersion : String := "flowref 1.0.0"
 def usageText : String :=
   "flowref — control-flow-aware xref + plausible-driven decompiler (compilable C)\n\n" ++
   "USAGE:\n" ++
-  "  flowref decompile <binary> <arch> <fnVaddrHex> <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
-  "  flowref xref      <binary> <arch> <targetHex>  <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
+  "  flowref decompile     <binary>  <arch> <fnVaddrHex> <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
+  "  flowref xref          <binary>  <arch> <targetHex>  <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
+  "  flowref decompile-asm <listing> <arch> <fnVaddrHex> [--search-trace]   (objdump-style .asm text)\n" ++
+  "  flowref xref-asm      <listing> <arch> <targetHex>  [--search-trace]   (objdump-style .asm text)\n" ++
   "  flowref --demo [--emit-c] [--search-trace]\n" ++
   "  flowref --demo-deep   (iterative-deepening escalation demonstration)\n" ++
   "  flowref <binary> <arch> <targetHex> <fileOffHex> <vaddrHex> <lenHex>   (legacy xref)\n" ++
   "  flowref --help | -h | --version\n\n" ++
   "ARGS:\n" ++
-  "  arch        x86 (32-bit) | ppc (64-bit big-endian)\n" ++
+  "  arch        x86 (32-bit) | x64 (x86-64) | ppc (64-bit big-endian)\n" ++
   "  fnVaddrHex  virtual address of the function to decompile (e.g. 0x401010)\n" ++
   "  targetHex   address/constant to find references to (xref)\n" ++
   "  fileOffHex  start offset of the region in the file\n" ++
@@ -187,6 +191,15 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
   -- the implicit return register
   let retReg := match a with | .x86 => "eax" | .ppc => "r3"
   declSet := declSet.insert (cName retReg) (regCType retReg)
+  -- The value returned by a `ret` is the SSA version of the return register
+  -- that *reaches* that `ret`, not the zero-initialised base local. With a
+  -- single reaching def we wire the return to it (so `return 7;` survives);
+  -- with zero or several (a φ across paths) we conservatively fall back to the
+  -- base local. This is what makes simple functions provably equivalent.
+  let retName := fun (q : Nat) =>
+    match (reachingDefsB 4000 insns addr2idx a q retReg).1 with
+    | [di] => cName ((ssaName.get? di).getD retReg)
+    | _    => cName retReg
   -- a generic condition temp type
   -- (we declare cond temps inline as needed)
 
@@ -229,7 +242,7 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
       let ins := insns[q]!
       if isUncondJmp a ins then
         if ins.mn.startsWith "ret" ∨ ins.mn == "blr" then
-          out := out ++ s!"  return {cName retReg};\n"
+          out := out ++ s!"  return {retName q};\n"
         else
           match branchTarget a ins with
           | some t => match addr2idx[t]? with
@@ -292,9 +305,16 @@ def emitC (a : A) (insns : Array Ins) (fnVa : Nat) : IO (String × Array TraceEn
         match writesReg a ins with
         | some r =>
           let nm := cName ((ssaName.get? q).getD r)
-          let subs := (useToVer.get? q).getD []
-          let rhs := renderExprC a ins subs
-          out := out ++ s!"  {nm} = ({regCType r})({rhs});\n"
+          -- Defensive: only emit an assignment when the destination lowers to a
+          -- legal C identifier. A malformed/foreign-syntax decode can yield a
+          -- non-register "destination" (e.g. an immediate); never emit that as
+          -- an lvalue — keep the unit compilable by dropping to a comment.
+          if okLocal nm then
+            let subs := (useToVer.get? q).getD []
+            let rhs := renderExprC a ins subs
+            out := out ++ s!"  {nm} = ({regCType r})({rhs});\n"
+          else
+            out := out ++ s!"  /* {ins.mn} {ins.ops} (non-register destination) */\n"
         | none =>
           -- store or other side-effecting op: lower a store to a mem write if possible.
           if hasMem ins.ops ∧ (ins.mn == "mov" ∨ ins.mn.startsWith "st") then
@@ -341,8 +361,7 @@ def demoInsns : Array Ins :=
     0x75,0x05,
     0xB9,0x01,0x00,0x00,0x00,
     0xC3 ]
-  (disasm Capstone.Arch.x86 Mode.b32 bytes 0x1000).map
-    (fun x => ({ addr := x.addr, mn := x.mnemonic, ops := x.ops } : Ins))
+  capstoneDecoder.decode .x86 (bytes, 0x1000)
 
 /-- A deep self-test: `mov esi, 0x1000` then a long clobber-free run of `nop`s,
 then `mov eax, [esi+4]` (a use of esi). The def→use walk must cross the whole
@@ -354,8 +373,7 @@ def demoDeepInsns (nNops : Nat) : Array Ins :=
   let nops : Array UInt8 := Array.replicate nNops 0x90           -- nop * nNops
   let epilogue : Array UInt8 := #[0x8B, 0x46, 0x04, 0xC3]        -- mov eax,[esi+4]; ret
   let bytes : ByteArray := ByteArray.mk (prologue ++ nops ++ epilogue)
-  (disasm Capstone.Arch.x86 Mode.b32 bytes 0x1000).map
-    (fun x => ({ addr := x.addr, mn := x.mnemonic, ops := x.ops } : Ins))
+  capstoneDecoder.decode .x86 (bytes, 0x1000)
 
 /-- Run the deep demo and report the escalation outcome for the `esi` use. -/
 def demoDeep : IO Unit := do
@@ -404,26 +422,42 @@ def main (args : List String) : IO Unit := do
       decompileInsns .x86 demoInsns 0x1000 showTrace
     return
   match positional with
+  -- ── decompile ──────────────────────────────────────────────────────────
   | "decompile" :: bin :: archS :: fnS :: foS :: vaS :: lenS :: _ =>
-    try
-      let (a, insns) ← load bin archS foS vaS lenS
-      if insns.isEmpty then IO.eprintln "error: empty disassembly for the given region"; IO.Process.exit 3
-      decompileInsns a insns (parseImm fnS).toNat showTrace
-    catch e => IO.eprintln s!"error: {e.toString}"; IO.Process.exit 4
+    guard (runDecompile (binaryFileAdapter bin archS foS vaS lenS) fnS showTrace)
+  | "decompile-asm" :: path :: archS :: fnS :: _ =>
+    guard (runDecompile (asmFileAdapter archS path) fnS showTrace)
+  -- ── xref ───────────────────────────────────────────────────────────────
   | "xref" :: bin :: archS :: tgtS :: foS :: vaS :: lenS :: _ =>
-    try xref bin archS tgtS foS vaS lenS showTrace
-    catch e => IO.eprintln s!"error: {e.toString}"; IO.Process.exit 4
+    guard (xref (binaryFileAdapter bin archS foS vaS lenS) tgtS showTrace)
+  | "xref-asm" :: path :: archS :: tgtS :: _ =>
+    guard (xref (asmFileAdapter archS path) tgtS showTrace)
+  -- ── legacy positional xref ─────────────────────────────────────────────
   | bin :: archS :: tgtS :: foS :: vaS :: lenS :: _ =>
-    try xref bin archS tgtS foS vaS lenS showTrace
-    catch e => IO.eprintln s!"error: {e.toString}"; IO.Process.exit 4
+    guard (xref (binaryFileAdapter bin archS foS vaS lenS) tgtS showTrace)
   | _ => IO.eprintln usageText; IO.Process.exit 2
 where
-  /-- The ORIGINAL behaviour: a single-target def→use witness search, now with
-  iterative deepening over the CFG-walk budget. -/
-  xref (bin archS tgtS foS vaS lenS : String) (showTrace : Bool) : IO Unit := do
-    let (a, insns) ← load bin archS foS vaS lenS
+  /-- Run an analysis action, mapping any `IO` error to a clean message + exit 4.
+  This keeps the untrusted-input failures (raised by the adapters) from dumping
+  a stack trace. -/
+  guard (act : IO Unit) : IO Unit := do
+    try act catch e => IO.eprintln s!"error: {e.toString}"; IO.Process.exit 4
+  /-- Decompile whatever a `SourceAdapter` yields to compilable C. -/
+  runDecompile (adapter : SourceAdapter) (fnS : String) (showTrace : Bool) : IO Unit := do
+    let fnVa ← match parseImm? fnS with
+      | some v => if v < 0 then throw (IO.userError s!"fnVaddr must be non-negative, got '{fnS}'") else pure v.toNat
+      | none => throw (IO.userError s!"invalid fnVaddr '{fnS}' (expected hex like 0x401010 or a decimal)")
+    let (a, insns) ← adapter.run
     if insns.isEmpty then IO.eprintln "error: empty disassembly for the given region"; IO.Process.exit 3
-    let target : Int := parseImm tgtS
+    decompileInsns a insns fnVa showTrace
+  /-- The ORIGINAL behaviour: a single-target def→use witness search, now with
+  iterative deepening over the CFG-walk budget, over any `SourceAdapter`. -/
+  xref (adapter : SourceAdapter) (tgtS : String) (showTrace : Bool) : IO Unit := do
+    let target : Int ← match parseImm? tgtS with
+      | some v => pure v
+      | none => throw (IO.userError s!"invalid target '{tgtS}' (expected hex like 0x401010 or a decimal)")
+    let (a, insns) ← adapter.run
+    if insns.isEmpty then IO.eprintln "error: empty disassembly for the given region"; IO.Process.exit 3
     let nI := insns.size
     let mut addr2idx : Std.HashMap Nat Nat := {}
     for i in [0:nI] do addr2idx := addr2idx.insert insns[i]!.addr i

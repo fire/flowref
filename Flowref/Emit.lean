@@ -25,8 +25,6 @@ The output is not guaranteed semantically faithful or type-correct — only that
 it parses and type-checks as C11.
 -/
 
-open Capstone
-
 namespace Flowref
 
 /-- Map an x86/ppc register name to a C width type. Default `uint32_t`. -/
