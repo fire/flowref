@@ -1,6 +1,8 @@
 /.lake/
 /build/
 *.olean
+# Vendored Capstone static archive built by lean-capstone's build.sh (5+ MB).
+/thirdparty/
 # Generated Decompile-Bench data (fetched samples + ETNF parquet output).
 # The small hand-authored fixture.ndjson IS tracked for the CI test.
 /decompile-bench/sample.ndjson

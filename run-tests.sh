@@ -246,5 +246,66 @@ case "$PEMSG" in
   *) fail "PE not identified in message: $PEMSG" ;;
 esac
 
+echo "== 17. PPC64 ELFv1 TOC resolution (r2 from .opd, ld off(r2) deref) =="
+if command -v python3 >/dev/null 2>&1; then
+  # Build a tiny big-endian PPC64 ELFv1 fixture exercising the TOC path:
+  #   .text  @0x1000 : a single `ld r3, DS(r2)` whose effective address (r2+DS)
+  #                    lands on a .toc1 pointer cell.
+  #   .toc1  @0x4000 : an 8-byte BE pointer cell holding the TARGET (0x10005000).
+  #   .opd   @0x5000 : one ELFv1 descriptor (entry, toc_base, env); toc_base is r2.
+  #   .rodata@0x10005000 : the referenced datum (a string).
+  # The recovered r2 must equal the .opd toc_base, and `xref` must report the
+  # `ld` site as resolving to the target through the .toc1 cell.
+  GEN="$(mktemp /tmp/flowref-toc.XXXXXX.py)"
+  cat > "$GEN" <<'PY'
+import struct,sys
+E='>'  # big-endian PPC64 ELFv1
+R2=0x4000             # module TOC base (points into .toc1)
+TGT=0x10005000        # the referenced datum (a .rodata string)
+TOC1=0x4000           # .toc1 cell vaddr (== r2 here, so DS=0)
+DS=(TOC1-R2)          # 0
+# .text: ld r3, DS(r2)  -> opcode 58, rD=3, rA=2, DS-form (low 2 bits xo=0)
+ld=(58<<26)|(3<<21)|(2<<16)|(DS&0xfffc)
+text=struct.pack(E+'I',ld)+struct.pack(E+'I',0x4e800020)  # + blr
+# .toc1: 8-byte BE pointer to TGT
+toc1=struct.pack(E+'Q',TGT)
+# .opd: one descriptor (entry=0x1000, toc=R2, env=0)
+opd=struct.pack(E+'QQQ',0x1000,R2,0)
+# .rodata
+rod=b'FpAnimClip.cpp\x00'
+shstr=b'\0.text\0.toc1\0.opd\0.rodata\0.shstrtab\0'
+def soff(n): return shstr.index(b'\0'+n+b'\0')+1
+EHSZ=64;SHSZ=64;nsh=6;sh_off=EHSZ
+# section file offsets laid out after the section header table
+base=sh_off+nsh*SHSZ
+text_off=base; toc1_off=text_off+len(text); opd_off=toc1_off+len(toc1)
+rod_off=opd_off+len(opd); shstr_off=rod_off+len(rod)
+def sh(name,typ,addr,off,size,ent=0):
+    return struct.pack(E+'IIQQQQIIQQ',name,typ,0,addr,off,size,0,0,1,ent)
+shdrs=(sh(0,0,0,0,0)
+  +sh(soff(b'.text'),1,0x1000,text_off,len(text))
+  +sh(soff(b'.toc1'),1,TOC1,toc1_off,len(toc1))
+  +sh(soff(b'.opd'),1,0x5000,opd_off,len(opd))
+  +sh(soff(b'.rodata'),1,TGT,rod_off,len(rod))
+  +sh(soff(b'.shstrtab'),3,0,shstr_off,len(shstr)))
+ei=bytes([0x7f,69,76,70,2,2,1,0,0,0,0,0,0,0,0,0])  # ELF64 BE
+eh=ei+struct.pack(E+'HHIQQQIHHHHHH',2,21,1,0x1000,0,sh_off,0,EHSZ,0,0,SHSZ,nsh,5)
+open(sys.argv[1],'wb').write(eh+shdrs+text+toc1+opd+rod+shstr)
+PY
+  TOCELF="$(mktemp /tmp/flowref-tocelf.XXXXXX)"
+  python3 "$GEN" "$TOCELF"
+  # r2 recovery + TOC deref reaching the target string at 0x10005000.
+  TOCOUT="$("$BIN" xref "$TOCELF" 0x1000 0x10005000 2>&1 || true)"
+  echo "$TOCOUT" | grep -q "recovered r2/TOC base = 0x4000" \
+    || { rm -f "$GEN" "$TOCELF"; fail "TOC r2 recovery wrong: $TOCOUT"; }
+  pass "TOC base r2=0x4000 recovered from .opd (not hardcoded .toc+0x8000)"
+  echo "$TOCOUT" | grep -q "0x1000:.*ld.*(r2).*→ 0x10005000" \
+    || { rm -f "$GEN" "$TOCELF"; fail "TOC ld(r2) did not resolve to target: $TOCOUT"; }
+  pass "ld off(r2) resolved through .toc1 cell to target 0x10005000"
+  rm -f "$GEN" "$TOCELF"
+else
+  echo "skip: python3 not available for TOC fixture generation"
+fi
+
 echo
 echo "ALL TESTS PASSED"

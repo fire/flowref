@@ -209,6 +209,38 @@ L6:;
 The counting loop (`eax_1 = eax_0 + 1`, back-edge `L2 → L1`) and the `if` on
 `ebx == 0xa` are both recovered, with SSA versions, and the result compiles.
 
+## PPC64 ELFv1 TOC resolution (`r2`-relative addressing)
+
+PowerPC64 ELFv1 code reaches module-level data and string constants **indirectly
+through the TOC**: a dedicated register `r2` holds a per-module constant *TOC
+base*, and a datum `A` is loaded either as `ld rX, off(r2)` (deref the pointer
+cell at `r2+off`, in `.toc1`) or via `addis rX, r2, hi` + `addi`/`ld` (compute
+`r2 + (hi<<16) + sext16(lo)`). A linear disassembler cannot follow this — the
+referenced address lives in a `.toc1` cell, not in the instruction stream.
+
+`flowref` recovers the module `r2` **authoritatively from `.opd`** (the function
+descriptors record the TOC base; we read it, never hardcoding `.toc + 0x8000`),
+then resolves both forms against the raw `.toc1` bytes (`Flowref/Toc.lean`):
+
+* **`xref`** (ELF form) reports each `.text` site whose TOC load resolves to the
+  searched target — alongside the immediate/`lis`-built (absolute-addressing)
+  witnesses the data-flow walk already finds.
+* **`decompile`** (ELF form) annotates every TOC-resolved load in the function
+  (`@addr: ld rX, off(r2) → 0x…`), to stderr so the C on stdout stays pipe-clean.
+
+```text
+$ flowref xref module.elf 0x1000 0x10005000
+TOC: recovered r2/TOC base = 0x4000 (from .opd)
+TOC: 1 r2-relative reference(s) to 0x10005000:
+  @0x1000: ld r3, 0(r2)  → 0x10005000
+```
+
+The packed 2×4-byte (`entry`,`toc`) descriptor layout some Cell/PS3 modules use
+is recovered as well as the canonical 3-doubleword ELFv1 form: `recoverR2?`
+accepts whichever `toc` field is constant and non-zero across the leading
+descriptors. Modules compiled with absolute addressing (no live TOC) are
+honestly reported as having no resolvable `r2`-relative site for the target.
+
 ## The plausible-driven design + iterative-deepening witness DAG
 
 Every data-flow fact is a **counterexample** to a plausible property:
@@ -287,6 +319,7 @@ builds Capstone from source.
 | `Flowref/Ports.lean` | `Decoder` + `SourceAdapter` port definitions. | ports |
 | `Flowref/Decoders.lean` | Capstone byte decoder, objdump-asm text decoder, `capstoneSpec?` (all arches). | adapters |
 | `Flowref/Adapters.lean` | Binary-file / decompile-bench / asm-text source adapters + input validation. | adapters |
+| `Flowref/Toc.lean` | PPC64 ELFv1 TOC resolution: recover `r2` from `.opd`, resolve `ld off(r2)` / `addis r2,…` to absolute targets. | kernel |
 | `Flowref.lean` | CLI, orchestration, C emission, demos. | composition root |
 | `Etnf.lean` | `flowref-etnf`: normalise Decompile-Bench → ETNF Parquet (zstd) via DuckDB. | tool (dep `lean_duckdb`) |
 

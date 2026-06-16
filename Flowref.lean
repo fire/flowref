@@ -4,6 +4,7 @@ import Flowref.Emit
 import Flowref.Ports
 import Flowref.Decoders
 import Flowref.Adapters
+import Flowref.Toc
 import Plausible
 import Lean.Data.Json
 
@@ -674,6 +675,21 @@ where
     let (a, bits, insns) ← (elfBinaryAdapter r bin).run
     if insns.isEmpty then IO.eprintln "error: empty disassembly for the resolved region"; IO.Process.exit 3
     decompileInsns a bits insns r.vaddr showTrace json
+    -- PPC64 ELFv1: annotate any TOC-relative loads in this function — the `r2`
+    -- base is recovered from `.opd`, then each `ld off(r2)` / `addis r2,…` site
+    -- is resolved to the absolute address it references. Notes go to stderr so
+    -- the C on stdout stays pipe-clean.
+    if r.arch == "ppc64" ∨ r.arch == "ppc64be" ∨ r.arch == "ppc64le" ∨ r.arch == "ppc" then
+      match ← Flowref.readElfBytes bin with
+      | none => pure ()
+      | some eb => match eb.recoverR2? with
+        | none => pure ()
+        | some r2 =>
+          let sites := Flowref.scanTocSites eb (Int.ofNat r2) insns
+          if ¬ sites.isEmpty then
+            IO.eprintln s!"=== TOC-resolved loads (r2=0x{hex r2} from .opd) ==="
+            for w in sites do
+              IO.eprintln s!"  @0x{hex w.vaddr}: {w.insn}  → 0x{hex w.resolved}"
   /-- ELF-resolved xref: resolve a function region from `(bin, fnTarget)`, then
   search it for def→use witnesses reaching `tgtS`. -/
   xrefElf (bin fnTarget tgtS : String) (archOverride? : Option String)
@@ -681,7 +697,41 @@ where
     let r ← elfResolveRegion bin fnTarget archOverride?
     let symNote := match r.symbol with | some s => s!" ({s})" | none => ""
     IO.eprintln s!"resolved region{symNote}: arch={r.arch} vaddr=0x{hex r.vaddr} fileOff=0x{hex r.fileOff} len=0x{hex r.len}"
+    -- PPC64 ELFv1: also resolve TOC-relative (`r2`) references. The module `r2`
+    -- is recovered authoritatively from `.opd`; a `ld off(r2)` / `addis r2,…`
+    -- site that lands on `target` is a reference the immediate-only walk cannot
+    -- see (the address is in a `.toc1` cell, not built by `lis/addi`).
+    runTocXref bin r.arch tgtS r json
     xref (elfBinaryAdapter r bin) tgtS showTrace json
+  /-- PPC64 TOC-relative reference search. Recover the module `r2` from `.opd`,
+  then scan the resolved region for `ld off(r2)` / `addis r2,…` sites whose
+  TOC-resolved address equals `target`. Witnesses (and the recovered `r2`) are
+  printed; in `--json` mode they go to stderr so the JSON stdout object from the
+  immediate-walk `xref` stays a single clean record. A no-op for non-PPC. -/
+  runTocXref (bin arch tgtS : String) (r : Flowref.ElfRegion) (json : Bool) : IO Unit := do
+    if arch != "ppc64" ∧ arch != "ppc64be" ∧ arch != "ppc64le" ∧ arch != "ppc" then return
+    let target : Int ← match parseImm? tgtS with
+      | some v => pure v
+      | none   => return            -- xref proper will report the bad target
+    match ← Flowref.readElfBytes bin with
+    | none => return
+    | some eb =>
+      match eb.recoverR2? with
+      | none =>
+        IO.eprintln "TOC: no .opd TOC base recovered (module may not use a TOC); skipping TOC resolution"
+      | some r2 =>
+        IO.eprintln s!"TOC: recovered r2/TOC base = 0x{hex r2} (from .opd)"
+        -- decode the resolved region and scan it for TOC references to target.
+        let (_a, _bits, insns) ← (elfBinaryAdapter r bin).run
+        let wits := Flowref.scanTocXref eb (Int.ofNat r2) target insns
+        if wits.isEmpty then
+          IO.eprintln s!"TOC: no r2-relative site in this region resolves to 0x{hex target.toNat}"
+        else
+          let hdr := s!"TOC: {wits.size} r2-relative reference(s) to 0x{hex target.toNat}:"
+          if json then IO.eprintln hdr else IO.println hdr
+          for w in wits do
+            let line := s!"  @0x{hex w.vaddr}: {w.insn}  → 0x{hex w.resolved}"
+            if json then IO.eprintln line else IO.println line
   /-- Decompile whatever a `SourceAdapter` yields to compilable C. -/
   runDecompile (adapter : SourceAdapter) (fnS : String) (showTrace json : Bool) : IO Unit := do
     let fnVa ← match parseImm? fnS with
