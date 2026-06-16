@@ -33,7 +33,11 @@ def flowrefVersion : String :=
 /-- Full usage text. -/
 def usageText : String :=
   "flowref — control-flow-aware xref + plausible-driven decompiler (compilable C)\n\n" ++
-  "USAGE:\n" ++
+  "USAGE (ELF — arch, file offset, vaddr & length read from the headers):\n" ++
+  "  flowref list          <binary>                                   (functions + detected arch)\n" ++
+  "  flowref decompile     <binary>  <symbol|0xVaddr>    [--arch=<a>] [--search-trace]\n" ++
+  "  flowref xref          <binary>  <symbol|0xVaddr> <targetHex> [--arch=<a>] [--search-trace]\n\n" ++
+  "USAGE (explicit region — for raw blobs / stripped binaries):\n" ++
   "  flowref decompile     <binary>  <arch> <fnVaddrHex> <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
   "  flowref xref          <binary>  <arch> <targetHex>  <fileOffHex> <vaddrHex> <lenHex> [--search-trace]\n" ++
   "  flowref decompile-asm <listing> <arch> <fnVaddrHex> [--search-trace]   (objdump-style .asm text)\n" ++
@@ -56,7 +60,11 @@ def usageText : String :=
   "                  so it can be piped to a compiler:\n" ++
   "                    flowref --demo --emit-c | gcc -xc -std=c11 -w -fsyntax-only -\n" ++
   "  --search-trace  print the iterative-deepening escalation chain to stderr\n" ++
+  "  --arch=<a>      force the arch for the ELF short forms (else read from header)\n" ++
   "  --help, -h      this help\n" ++
+  "\nNOTE: decompile writes the C to stdout and all notes/traces to stderr, so\n" ++
+  "  flowref decompile a.out main | gcc -xc -std=c11 -w -fsyntax-only -\n" ++
+  "works with the resolution note still shown on the terminal.\n" ++
   "  --version       version string\n"
 
 /-- Build the full compilable C translation unit for a function. Returns the C
@@ -516,9 +524,32 @@ def demoParams (emitC? : Bool) : IO Unit := do
     IO.println ""
     IO.println "(pipe `flowref --demo-params --emit-c` to gcc to confirm it compiles)"
 
+/-- `flowref list <bin>` — read the ELF and print the detected arch plus the
+FUNC symbols (name, vaddr, size). This is the discovery menu you pick from for
+`decompile <bin> <name>`. Fails cleanly if `bin` is not an ELF. -/
+def runList (bin : String) : IO Unit := do
+  match ← readElf bin with
+  | none => IO.eprintln s!"error: '{bin}' is not a readable ELF"; IO.Process.exit 3
+  | some info =>
+    let archTok := info.arch
+    let archShow := if archTok.isEmpty then s!"unknown (e_machine={info.machine})" else archTok
+    let cls := if info.is64 then "ELF64" else "ELF32"
+    let endian := if info.littleEndian then "LE" else "BE"
+    let fns := info.functions
+    IO.println s!"{bin}: {cls} {endian}  arch={archShow}  entry=0x{hex info.entry}  functions={fns.size}"
+    if fns.isEmpty then
+      IO.println "  (no FUNC symbols — binary may be stripped; use the explicit-region form)"
+    else
+      IO.println "  VADDR       SIZE    NAME"
+      for fn in fns do
+        IO.println s!"  0x{hex fn.vaddr}  {fn.size}\t{fn.name}"
+
 def main (args : List String) : IO Unit := do
   let hasFlag := fun (f : String) => args.contains f
   let showTrace := hasFlag "--search-trace"
+  -- `--arch=<tok>` forces the arch for the ELF-resolved short forms (rare:
+  -- a misidentified e_machine). Otherwise the arch comes from the ELF header.
+  let archOverride? := (args.find? (·.startsWith "--arch=")).map (·.drop 7 |>.toString)
   let positional := args.filter (fun s => ¬ s.startsWith "--")
   match args with
   | [] => IO.eprintln usageText; IO.Process.exit 2
@@ -541,12 +572,21 @@ def main (args : List String) : IO Unit := do
       decompileInsns .x86 .b32 demoInsns 0x1000 showTrace
     return
   match positional with
+  -- ── list (ELF discovery) ────────────────────────────────────────────────
+  | "list" :: bin :: _ => guard (runList bin)
   -- ── decompile ──────────────────────────────────────────────────────────
+  -- ELF short form: resolve a symbol/address to a region from the headers.
+  | ["decompile", bin, target] =>
+    guard (runDecompileElf bin target archOverride? showTrace)
   | "decompile" :: bin :: archS :: fnS :: foS :: vaS :: lenS :: _ =>
     guard (runDecompile (binaryFileAdapter bin archS foS vaS lenS) fnS showTrace)
   | "decompile-asm" :: path :: archS :: fnS :: _ =>
     guard (runDecompile (asmFileAdapter archS path) fnS showTrace)
   -- ── xref ───────────────────────────────────────────────────────────────
+  -- ELF short form: <bin> <fnSym|fnAddr> <targetHex> — region from the ELF,
+  -- target is what to find references to.
+  | ["xref", bin, fnTarget, tgtS] =>
+    guard (xrefElf bin fnTarget tgtS archOverride? showTrace)
   | "xref" :: bin :: archS :: tgtS :: foS :: vaS :: lenS :: _ =>
     guard (xref (binaryFileAdapter bin archS foS vaS lenS) tgtS showTrace)
   | "xref-asm" :: path :: archS :: tgtS :: _ =>
@@ -561,6 +601,26 @@ where
   a stack trace. -/
   guard (act : IO Unit) : IO Unit := do
     try act catch e => IO.eprintln s!"error: {e.toString}"; IO.Process.exit 4
+  /-- ELF-resolved decompile: derive (arch, fileOff, vaddr, len) from the ELF
+  headers for `target` (a FUNC symbol or a `0x` address), report the resolution
+  to stderr, then decompile that region. The function vaddr to carve is the
+  resolved region's vaddr. -/
+  runDecompileElf (bin target : String) (archOverride? : Option String)
+      (showTrace : Bool) : IO Unit := do
+    let r ← elfResolveRegion bin target archOverride?
+    let symNote := match r.symbol with | some s => s!" ({s})" | none => ""
+    IO.eprintln s!"resolved{symNote}: arch={r.arch} vaddr=0x{hex r.vaddr} fileOff=0x{hex r.fileOff} len=0x{hex r.len}"
+    let (a, bits, insns) ← (elfBinaryAdapter r bin).run
+    if insns.isEmpty then IO.eprintln "error: empty disassembly for the resolved region"; IO.Process.exit 3
+    decompileInsns a bits insns r.vaddr showTrace
+  /-- ELF-resolved xref: resolve a function region from `(bin, fnTarget)`, then
+  search it for def→use witnesses reaching `tgtS`. -/
+  xrefElf (bin fnTarget tgtS : String) (archOverride? : Option String)
+      (showTrace : Bool) : IO Unit := do
+    let r ← elfResolveRegion bin fnTarget archOverride?
+    let symNote := match r.symbol with | some s => s!" ({s})" | none => ""
+    IO.eprintln s!"resolved region{symNote}: arch={r.arch} vaddr=0x{hex r.vaddr} fileOff=0x{hex r.fileOff} len=0x{hex r.len}"
+    xref (elfBinaryAdapter r bin) tgtS showTrace
   /-- Decompile whatever a `SourceAdapter` yields to compilable C. -/
   runDecompile (adapter : SourceAdapter) (fnS : String) (showTrace : Bool) : IO Unit := do
     let fnVa ← match parseImm? fnS with

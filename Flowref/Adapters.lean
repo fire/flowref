@@ -1,4 +1,5 @@
 import Flowref.Decoders
+import Flowref.Elf
 
 /-! # flowref — data **adapters** (implementations of the `SourceAdapter` port)
 
@@ -98,6 +99,31 @@ def asmFileAdapter (archS path : String) : SourceAdapter where
     if insns.isEmpty then
       throw (IO.userError s!"assembly listing '{path}' decoded to zero instructions (unrecognised format?)")
     pure (a, bitsOfArchString archS, insns)
+
+/-- **ELF symbol/address resolution.** Read `bin` as an ELF, resolve `target`
+(a FUNC symbol name or a `0x` vaddr) to a `(arch, fileOff, vaddr, len)` region
+via the section map + symbol table, so the caller need not supply any of them.
+`archOverride?` forces the arch token (for the rare misidentified machine).
+Raises `IO.userError` when `bin` is not a readable ELF or `target` cannot be
+resolved — the untrusted-input boundary, same as the other adapters. -/
+def elfResolveRegion (bin target : String) (archOverride? : Option String) : IO ElfRegion := do
+  match ← readElf bin with
+  | none =>
+    throw (IO.userError
+      s!"'{bin}' is not a readable ELF; use the explicit-region form (arch fileOff vaddr len) for raw blobs")
+  | some info =>
+    match info.resolve target with
+    | .error msg => throw (IO.userError msg)
+    | .ok region => pure { region with arch := archOverride?.getD region.arch }
+
+/-- **ELF-backed source adapter.** Resolve `target` within `bin` via the ELF
+headers, then decode that region with Capstone — the two-argument convenience
+path (`decompile <bin> <sym|addr>`). The resolved region is also returned by
+`elfResolveRegion` for callers that need the function vaddr (e.g. decompile). -/
+def elfBinaryAdapter (region : ElfRegion) (bin : String) : SourceAdapter :=
+  { binaryFileAdapter bin region.arch
+      s!"0x{hex region.fileOff}" s!"0x{hex region.vaddr}" s!"0x{hex region.len}"
+    with name := "elf-binary" }
 
 /-- Back-compatible thin wrapper over `binaryFileAdapter` — the historical
 `load` entry point, now expressed through the port. -/

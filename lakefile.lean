@@ -4,6 +4,24 @@ open Lake DSL System
 package flowref where
   -- moreLeancArgs / moreLinkArgs left default
 
+/-! ## ELF parser FFI (elfutils libelf/gelf).
+    `ffi/elf_shim.c` is C glue over the system `libelf` (elfutils): it returns a
+    TSV dump (header machine/class/endian, sections, FUNC symbols) that
+    `Flowref/Elf.lean` parses. Mirrors the lean-capstone shim pattern. The
+    `elfshim` static glue is linked transitively as an `extern_lib`; the `flowref`
+    exe additionally links the system `-lelf`. -/
+
+target elfShimO pkg : FilePath := do
+  let oFile := pkg.buildDir / "ffi" / "elf_shim.o"
+  let srcJob ← inputTextFile <| pkg.dir / "ffi" / "elf_shim.c"
+  let weakArgs := #["-I", (← getLeanIncludeDir).toString]
+  buildO oFile srcJob weakArgs #["-fPIC", "-O2"] "cc" getLeanTrace
+
+extern_lib libelfshim pkg := do
+  let name := nameToStaticLib "elfshim"
+  let oJob ← elfShimO.fetch
+  buildStaticLib (pkg.staticLibDir / name) #[oJob]
+
 require plausible from git
   "https://github.com/leanprover-community/plausible" @ "v4.30.0"
 
@@ -32,7 +50,11 @@ require lean_duckdb from git
   moreLinkArgs := #[
     "-Wl,--start-group",
     ".lake/packages/lean-capstone/thirdparty/capstone/lib/libcapstone.a",
-    "-Wl,--end-group"]
+    "-Wl,--end-group",
+    -- elfutils libelf, for the ELF parser shim (ffi/elf_shim.c). Referenced by
+    -- full path (like the capstone archive above) so we don't add a system-wide
+    -- -L that would shadow the toolchain libc. Matches `pkg-config --libs libelf`.
+    "/home/linuxbrew/.linuxbrew/lib/libelf.so"]
 
 -- ETNF normaliser: reads Decompile-Bench rows (ndjson) and writes redundancy-free
 -- Parquet relations (zstd) via DuckDB. Links the vendored libduckdb.so (Lake does

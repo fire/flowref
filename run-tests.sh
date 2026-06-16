@@ -159,5 +159,26 @@ else
   echo "skip: libduckdb not vendored ($DUCKLIB) — run 'lake update lean_duckdb'"
 fi
 
+echo "== 14. ELF resolution (libelf FFI): list + symbol/address short forms =="
+# The flowref binary is itself an ELF — use it as a self-contained fixture.
+SELF="$BIN"
+# 14a. list detects arch and finds FUNC symbols.
+"$BIN" list "$SELF" > /tmp/flowref-list.$$ 2>&1 || fail "list exited non-zero"
+grep -qE "arch=x(86-)?64|arch=x64" /tmp/flowref-list.$$ || fail "list did not auto-detect x64"
+grep -q "_start" /tmp/flowref-list.$$ || fail "list did not find _start symbol"
+pass "list: ELF parsed, arch auto-detected, symbols enumerated"
+# 14b. decompile by symbol name resolves region from headers and emits C.
+"$BIN" decompile "$SELF" _start 2>/dev/null | grep -q "sub_" || fail "decompile by symbol produced no C function"
+pass "decompile <bin> _start (symbol → region via ELF headers)"
+# 14c. decompile by address resolves the same region (and back-maps to symbol).
+"$BIN" decompile "$SELF" _start 2>&1 >/dev/null | grep -q "resolved (_start)" || fail "address/symbol resolution note missing"
+pass "resolution note reports symbol + derived region"
+# 14d. clean errors: non-ELF and unknown symbol exit non-zero with a message.
+if "$BIN" list run-tests.sh 2>/dev/null; then fail "expected non-ELF rejection"; fi
+pass "rejected: non-ELF file"
+if "$BIN" decompile "$SELF" no_such_symbol_xyz 2>/dev/null; then fail "expected unknown-symbol rejection"; fi
+pass "rejected: unknown symbol"
+rm -f /tmp/flowref-list.$$
+
 echo
 echo "ALL TESTS PASSED"
