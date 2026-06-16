@@ -216,6 +216,7 @@ builds Capstone from source.
 | `Flowref/Decoders.lean` | Capstone byte decoder, objdump-asm text decoder, `capstoneSpec?` (all arches). | adapters |
 | `Flowref/Adapters.lean` | Binary-file / decompile-bench / asm-text source adapters + input validation. | adapters |
 | `Flowref.lean` | CLI, orchestration, C emission, demos. | composition root |
+| `Etnf.lean` | `flowref-etnf`: normalise Decompile-Bench → ETNF Parquet (zstd) via DuckDB. | tool (dep `lean_duckdb`) |
 
 ## Evaluation — Decompile-Bench equivalence
 

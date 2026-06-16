@@ -124,6 +124,79 @@ private def deAtt (s : String) : String :=
 
 private def isSpace (c : Char) : Bool := c == ' ' ∨ c == '\t'
 
+/-! ### AT&T → Intel normalisation (decoder-local; the kernel is Intel-only)
+
+The Decompile-Bench `asm` column (and `objdump` default) is **AT&T**: operand
+order is reversed (`src, dst`), immediates carry `$`, registers `%`, memory is
+`disp(base, index, scale)`, and mnemonics carry size suffixes (`movl`, `addq`).
+flowref's kernel patterns are Intel/no-suffix, so we normalise here — entirely
+inside the decoder, so nothing in the kernel changes. -/
+
+/-- Split an operand list on **top-level** commas (commas inside `(...)` — the
+AT&T memory `base,index,scale` — are kept). -/
+private def splitTopComma (s : String) : List String := Id.run do
+  let mut out : List String := []
+  let mut cur : String := ""
+  let mut depth : Nat := 0
+  for c in s.toList do
+    if c == '(' then depth := depth + 1; cur := cur.push c
+    else if c == ')' then depth := depth - 1; cur := cur.push c
+    else if c == ',' ∧ depth == 0 then out := out ++ [cur]; cur := ""
+    else cur := cur.push c
+  pure (out ++ [cur])
+
+/-- Convert one AT&T operand to Intel. Memory `disp(base,index,scale)` becomes
+`[base+index*scale+disp]`; registers/immediates pass through (sigils already
+stripped by `deAtt`). -/
+private def attMemToIntel (op0 : String) : String :=
+  let op := op0.trimAscii.toString
+  match op.splitOn "(" with
+  | [_] => op                              -- no '(' ⇒ register / immediate / disp
+  | disp :: rest =>
+    let inner := ((String.intercalate "(" rest).splitOn ")").headD ""
+    let parts := (inner.splitOn ",").map (·.trimAscii.toString)
+    let base := parts.getD 0 ""
+    let index := parts.getD 1 ""
+    let scale := parts.getD 2 ""
+    let d := disp.trimAscii.toString
+    let e0 := base
+    let e1 := if index ≠ "" then
+        (if e0 == "" then index else e0 ++ "+" ++ index) ++
+        (if scale ≠ "" ∧ scale ≠ "1" then "*" ++ scale else "")
+      else e0
+    let e2 := if d == "" then e1
+      else if d.startsWith "-" then (if e1 == "" then d else e1 ++ d)
+      else (if e1 == "" then d else e1 ++ "+" ++ d)
+    "[" ++ e2 ++ "]"
+  | [] => op
+
+/-- x86 mnemonic stems that take an AT&T size suffix (`b`/`w`/`l`/`q`). -/
+private def attStems : List String :=
+  ["mov","add","sub","adc","sbb","and","or","xor","cmp","test","lea","imul",
+   "mul","idiv","div","inc","dec","neg","not","shl","shr","sar","sal","push",
+   "pop","call","ret","xchg"]
+
+/-- Strip an AT&T size suffix from a mnemonic, mapping the sign/zero-extend forms
+to the kernel's `movsx`/`movzx`. Jumps (`j…`) keep their condition letters. -/
+private def stripSuffix (mn : String) : String :=
+  if mn.startsWith "j" then mn
+  else if mn.startsWith "movz" then "movzx"
+  else if mn.startsWith "movs" ∧ mn.length > 4 then "movsx"
+  else match mn.toList.getLast? with
+    | some c =>
+      if c == 'b' ∨ c == 'w' ∨ c == 'l' ∨ c == 'q' then
+        let stem := mn.dropRight 1
+        if attStems.contains stem then stem else mn
+      else mn
+    | none => mn
+
+/-- Normalise an AT&T `(mnemonic, operands)` to Intel form: strip the suffix,
+reverse operand order, and lower memory operands. -/
+private def attToIntel (mn ops : String) : String × String :=
+  let parts := (splitTopComma ops).map (·.trimAscii.toString) |>.filter (· ≠ "")
+  let intel := parts.reverse.map attMemToIntel
+  (stripSuffix mn, String.intercalate ", " intel)
+
 /-- Parse one assembly-listing line into an `Ins`, or `none` if it carries no
 address + mnemonic. Accepts the common shapes:
 
@@ -151,9 +224,13 @@ def parseAsmLine (ln0 : String) : Option Ins := do
   let body := body.trimAscii.toString
   if body.isEmpty then failure
   let chars := body.toList
-  let mn := String.ofList (chars.takeWhile (fun c => ¬ isSpace c))
-  if mn.isEmpty then failure
-  let ops := deAtt ((String.ofList (chars.dropWhile (fun c => ¬ isSpace c))).trimAscii.toString)
+  let mnRaw := String.ofList (chars.takeWhile (fun c => ¬ isSpace c))
+  if mnRaw.isEmpty then failure
+  let opsRaw := (String.ofList (chars.dropWhile (fun c => ¬ isSpace c))).trimAscii.toString
+  -- AT&T is detected by a `%` register sigil; normalise it to Intel in-decoder.
+  let isAtt := opsRaw.any (· == '%')
+  let ops0 := deAtt opsRaw
+  let (mn, ops) := if isAtt then attToIntel mnRaw ops0 else (mnRaw, ops0)
   pure { addr := addr, mn := mn, ops := ops }
 
 /-- Parse a whole assembly listing into `Ins[]`, skipping unparsable lines. -/

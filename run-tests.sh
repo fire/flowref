@@ -127,5 +127,21 @@ else
   echo "skip: C compiler cannot build the equivalence demo"
 fi
 
+echo "== 13. ETNF Parquet(zstd) normaliser (lean-duckdb) =="
+DUCKLIB=".lake/packages/lean_duckdb/vendor/libduckdb.so"
+if [ -f "$DUCKLIB" ]; then
+  lake build flowref-etnf || fail "flowref-etnf build"
+  ETOUT="$(mktemp -d /tmp/flowref-etnf.XXXXXX)"
+  ./.lake/build/bin/flowref-etnf decompile-bench/fixture.ndjson "$ETOUT" | tee "$ETOUT/log"
+  grep -q "lossless-join verified" "$ETOUT/log" || { rm -rf "$ETOUT"; fail "ETNF lossless verification"; }
+  for rel in etnf_file etnf_source etnf_asm etnf_function; do
+    test -f "$ETOUT/$rel.parquet" || { rm -rf "$ETOUT"; fail "missing $rel.parquet"; }
+  done
+  rm -rf "$ETOUT"
+  pass "ETNF relations written + lossless-join verified"
+else
+  echo "skip: libduckdb not vendored ($DUCKLIB) — run 'lake update lean_duckdb'"
+fi
+
 echo
 echo "ALL TESTS PASSED"

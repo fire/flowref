@@ -1,3 +1,8 @@
 /.lake/
 /build/
 *.olean
+# Generated Decompile-Bench data (fetched samples + ETNF parquet output).
+# The small hand-authored fixture.ndjson IS tracked for the CI test.
+/decompile-bench/sample.ndjson
+/decompile-bench/etnf/
+/decompile-bench/out/

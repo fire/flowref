@@ -88,3 +88,36 @@ distinctly from `NOT-EQUIVALENT`, so the harness never overstates a "win."
 Best-effort streaming loader (needs `datasets` + network; not in CI). It prints
 the dataset `features` so you can adapt field extraction, then writes
 `out/<i>.bin` + `out/<i>.c` pairs to feed `equiv.sh`.
+
+## ETNF storage — `flowref-etnf` (lean-duckdb)
+
+The dataset is a flat relation `R{name, code, asm, file}` — redundant: a `file`
+path repeats per function, and identical `code`/`asm` bodies recur. We re-encode
+it as **Parquet (zstd)** decomposed into **Essential Tuple Normal Form**: a
+lossless-join decomposition where every explicit join dependency has a superkey
+component, so nothing is stored redundantly and no tuple is spurious.
+
+```
+  etnf_file(file_id PK, path)                                   -- distinct paths
+  etnf_source(code_id PK, code)                                 -- distinct sources
+  etnf_asm(asm_id PK, asm)                                      -- distinct assembly
+  etnf_function(func_id PK, file_id→, name, code_id→, asm_id→)  -- fact table (keys)
+```
+
+IDs are `md5` content hashes, so each dimension stores a value once;
+`R = etnf_function ⋈ etnf_file ⋈ etnf_source ⋈ etnf_asm` and `func_id` is a
+superkey of that JD ⇒ ETNF.
+
+Implemented entirely in Lean over **DuckDB** (`../Etnf.lean`, dep
+`lean_duckdb`): each relation is one self-contained
+`COPY (...) TO '...parquet' (FORMAT PARQUET, COMPRESSION ZSTD)`, and a final SQL
+query proves the join is lossless (`missing = extra = 0`).
+
+```bash
+python3 fetch_rows.py --n 500 --out sample.ndjson      # datasets-server REST, no deps
+flowref-etnf sample.ndjson etnf/                        # → etnf_{file,source,asm,function}.parquet
+# 500 rows → 152 files, 416 sources, 499 asm; 5.4× smaller than the ndjson; lossless ✓
+```
+
+`fixture.ndjson` (6 hand-authored rows) is the committed CI fixture
+(test 13 in `../run-tests.sh`).
