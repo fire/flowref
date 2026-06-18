@@ -26,6 +26,9 @@ extern_lib libelfshim pkg := do
 require plausible from git
   "https://github.com/leanprover-community/plausible" @ "v4.30.0"
 
+require «plausible-witness-dag» from git
+  "https://github.com/fire/plausible-witness-dag" @ "main"
+
 -- Multi-arch disassembler (typed Capstone wrapper). Provides the `Capstone`
 -- module + the C glue; the static `libcapstone.a` is linked below.
 require «lean-capstone» from git

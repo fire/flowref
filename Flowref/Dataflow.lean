@@ -1,5 +1,6 @@
 import Flowref.Disasm
 import Plausible
+import PlausibleWitnessDag
 
 /-! # flowref — plausible-driven data-flow with an iterative-deepening witness DAG
 
@@ -31,37 +32,18 @@ open Plausible
 
 namespace Flowref
 
-/-- One rung of the iterative-deepening ladder. -/
-structure Level where
-  idx       : Nat       -- L0, L1, L2, …
-  walkSteps : Nat       -- CFG-walk step budget
-  finBound  : Nat       -- plausible `Fin N` candidate window (one of the literals below)
-  numInst   : Nat       -- plausible instance count
-  deriving Repr, Inhabited
+/-- One rung of the iterative-deepening ladder. Re-exported from the standalone
+`fire/plausible-witness-dag` package for existing `Flowref.Dataflow` callers. -/
+abbrev Level := PlausibleWitnessDag.Level
 
-/-- The escalation ladder. L0 is cheap; higher rungs widen every budget. The
-`finBound`s are the literals that the plausible props below are specialised to. -/
-def ladder : Array Level := #[
-  { idx := 0, walkSteps := 64,    finBound := 256,   numInst := 200  },
-  { idx := 1, walkSteps := 512,   finBound := 1024,  numInst := 800  },
-  { idx := 2, walkSteps := 4000,  finBound := 4096,  numInst := 2000 } ]
+/-- The escalation ladder. -/
+def ladder : Array Level := PlausibleWitnessDag.ladder
 
-/-- Outcome of one plausible query at a given level. We must distinguish
-"provably none" (the search space was fully covered and no witness exists — a
-real negative) from "ran out of budget" (the walk hit its step cap, so a witness
-*might* exist deeper). Only the latter escalates. -/
-inductive Outcome
-  | found        (witnessIdx : Nat)   -- plausible handed back a counterexample
-  | provablyNone                      -- exhausted within budget, genuinely no witness
-  | budgetHit                         -- bound reached; unresolved, escalate
-  deriving Repr, DecidableEq, Inhabited
+/-- Outcome of one plausible query at a given level. -/
+abbrev Outcome := PlausibleWitnessDag.Outcome
 
 /-- A trace entry: which query resolved at which level, with what outcome. -/
-structure TraceEntry where
-  query   : String
-  level   : Nat
-  outcome : Outcome
-  deriving Repr
+abbrev TraceEntry := PlausibleWitnessDag.TraceEntry
 
 /-! ## Instruction-level reachability (the witness walk)
 
@@ -137,22 +119,8 @@ private def candIsReaching (steps : Nat) (insns : Array Ins) (addr2idx : Std.Has
 (true ⇒ plausible found a counterexample ⇒ a reaching def exists). -/
 def certifyReaching (lvl : Level) (insns : Array Ins) (addr2idx : Std.HashMap Nat Nat)
     (a : A) (j : Nat) (r : String) : IO Bool := do
-  let cfg : Plausible.Configuration := { numInst := lvl.numInst, quiet := true }
   let steps := lvl.walkSteps
-  -- specialise to the literal Fin bound for this level.
-  match lvl.finBound with
-    | 256 =>
-      let p := NamedBinder "w" (∀ w : Fin 256, (! candIsReaching steps insns addr2idx a j r w.val) = true)
-      let res ← Testable.checkIO p cfg
-      pure res.isFailure
-    | 1024 =>
-      let p := NamedBinder "w" (∀ w : Fin 1024, (! candIsReaching steps insns addr2idx a j r w.val) = true)
-      let res ← Testable.checkIO p cfg
-      pure res.isFailure
-    | _ =>
-      let p := NamedBinder "w" (∀ w : Fin 4096, (! candIsReaching steps insns addr2idx a j r w.val) = true)
-      let res ← Testable.checkIO p cfg
-      pure res.isFailure
+  PlausibleWitnessDag.certify lvl (fun w => candIsReaching steps insns addr2idx a j r w)
 
 /-! ## The iterative-deepening driver for a single reaching-def query -/
 
@@ -162,23 +130,12 @@ the level at which it resolved, and a trace entry. -/
 def resolveReachingDef (insns : Array Ins) (addr2idx : Std.HashMap Nat Nat)
     (a : A) (j : Nat) (r : String) : IO (List Nat × Nat × TraceEntry) := do
   let qname := s!"reaching-def {r}@0x{hex insns[j]!.addr}"
-  let mut chosen : List Nat := []
-  let mut lvlIdx := 0
-  let mut outcome : Outcome := .provablyNone
-  let mut resolved := false
-  for lvl in ladder do
-    if ¬ resolved then
-      -- plausible decides existence; the deterministic walk reads the witness back.
-      let _failure ← certifyReaching lvl insns addr2idx a j r
-      let (defs, budgetHit) := reachingDefsB lvl.walkSteps insns addr2idx a j r
-      lvlIdx := lvl.idx
-      chosen := defs
-      if ¬ defs.isEmpty then
-        outcome := .found (defs.headD 0); resolved := true
-      else if ¬ budgetHit then
-        outcome := .provablyNone; resolved := true     -- genuine negative: stop deepening
-      else
-        outcome := .budgetHit                            -- unresolved: escalate
-  pure (chosen, lvlIdx, { query := qname, level := lvlIdx, outcome })
+  PlausibleWitnessDag.resolve qname
+    (fun lvl w => candIsReaching lvl.walkSteps insns addr2idx a j r w)
+    (fun steps =>
+      let (defs, budgetHit) := reachingDefsB steps insns addr2idx a j r
+      { value := defs, found := !defs.isEmpty, witnessIdx := defs.headD 0,
+        budgetHit := budgetHit })
+    ladder
 
 end Flowref
